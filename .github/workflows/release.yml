@@ -1,0 +1,41 @@
+name: Build and Release
+
+# Trigger condition: Triggered when you push a tag starting with v (e.g., v1.0.0)
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: # Allow manual triggers from the GitHub page
+
+permissions:
+  contents: write # Grant permission to create releases and upload files
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod' # Automatically install the version specified in go.mod
+
+      - name: Make build script executable
+        run: chmod +x build.sh
+
+      - name: Run Build Script
+        run: ./build.sh
+
+      - name: Generate Release Notes
+        run: echo "Automatically generated release version" > release_notes.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/* # Upload all files compiled in the bin directory
+          body_path: release_notes.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
