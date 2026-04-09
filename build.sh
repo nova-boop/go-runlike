@@ -6,6 +6,7 @@ go mod tidy
 
 # 2. Define build targets
 targets=(
+    "android/arm64"
     "linux/amd64"
     "linux/arm64"
     "darwin/amd64"
@@ -21,7 +22,7 @@ for target in "${targets[@]}"; do
     [ "$os" == "windows" ] && output+=".exe"
 
     echo "Building: $output ..."
-    GOOS=$os GOARCH=$arch go build -ldflags="-s -w" -o "$output" main.go
+    CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags="-s -w" -o "$output" main.go
 done
 
 echo "✅ Build complete! All files are located in the bin/ directory."
