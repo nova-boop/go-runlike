@@ -7,13 +7,14 @@
 <a name="english"></a>
 ## 🌍 English
 
-**go-runlike** is a high-performance, single-binary tool written in Go. It reverse-engineers running Docker containers into their original `docker run` commands or modern `docker-compose.yml` files.
+**go-runlike** is a high-performance, single-binary tool written in Go. It reverse-engineers running Docker containers into their original `docker run` commands or modern `docker-compose.yml` files, and can clean up bloated container log files.
 
 ### ✨ Key Features
 * **Zero Dependencies**: A static single binary. No Python or runtime libraries required.
 * **Smart Parameter Merging**: Automatically combines flags into `-dit` for cleaner, more professional output.
 * **Docker Compose Generation**: Use `-y` or `--yml` to instantly create production-ready Compose files.
 * **Batch Export**: Use `-a` to export all containers at once — shell commands, YAML, or both.
+* **Log Cleanup**: Use `-c` to truncate all containers' `json.log` files and reclaim disk space.
 * **Modern Networking**: Implements modern `networks` mapping with `external: true` declarations, replacing legacy `--link`.
 * **Clean Output**: Intelligent diff-filtering excludes default image ENV variables and WorkDirs.
 * **Comprehensive Support**: Handles Volumes, Devices, Logging, DNS, Sysctls, Capabilities, and more.
@@ -61,6 +62,30 @@ Output structure:
 └── caddy_filebrowser.yml      # "/" in names replaced with "_"
 ```
 
+### 🧹 Clean Container Logs (-c)
+
+Truncate all containers' `json.log` files to free disk space:
+
+```bash
+./runlike -c
+```
+
+If not running as root, it automatically prompts for sudo password:
+
+```
+🔒 Root permission required, requesting sudo...
+[sudo] password for user:
+🔍 Docker Root Dir: /var/lib/docker
+📊 Found 5 containers
+
+  1. nginx                id: a1b2c3d4e5f6  log: 128.5 MB
+     ✅ /var/lib/docker/containers/a1b2.../a1b2...-json.log
+  2. redis                id: f6e5d4c3b2a1  log: 32.1 MB
+     ✅ /var/lib/docker/containers/f6e5.../f6e5...-json.log
+
+✅ Done! 2 log files cleaned
+```
+
 ### 📋 All Options
 
 | Flag | Description |
@@ -69,6 +94,7 @@ Output structure:
 | `-y`, `--yml` | Output as Docker Compose YAML |
 | `-a` | Export all containers to files |
 | `-o <dir>` | Output directory for `-a` mode (default: `./`, auto-created) |
+| `-c` | Clean all containers' json.log files (auto sudo if needed) |
 | `-no-name` | Omit `--name` parameter |
 | `-l` | Omit labels |
 
@@ -77,13 +103,14 @@ Output structure:
 <a name="中文"></a>
 ## 🌍 中文
 
-**go-runlike** 是一个高性能的 Go 单文件 CLI 工具。它通过 Docker Engine API 检查运行中的容器，反向生成等效的 `docker run` 命令或 `docker-compose.yml` 文件。
+**go-runlike** 是一个高性能的 Go 单文件 CLI 工具。它通过 Docker Engine API 检查运行中的容器，反向生成等效的 `docker run` 命令或 `docker-compose.yml` 文件，还能清理膨胀的容器日志文件。
 
 ### ✨ 主要特性
 * **零依赖**：静态编译的单文件二进制，无需 Python 或运行时库
 * **智能参数合并**：自动将参数合并为 `-dit` 形式，输出更简洁专业
 * **Docker Compose 生成**：使用 `-y` 或 `--yml` 即可生成生产级 Compose 文件
 * **批量导出**：使用 `-a` 一次性导出所有容器 — shell 命令、YAML 或两者兼有
+* **日志清理**：使用 `-c` 清空所有容器的 `json.log` 文件，释放磁盘空间
 * **现代网络**：使用 `networks` 映射 + `external: true` 声明，取代旧的 `--link`
 * **智能过滤**：自动对比镜像默认值，过滤掉冗余的 ENV、ExposedPorts、WorkDir
 * **全面支持**：处理 Volumes、Devices、Logging、DNS、Sysctls、Capabilities 等
@@ -131,6 +158,30 @@ go build -ldflags="-s -w" -o runlike main.go
 └── caddy_filebrowser.yml      # 名称中的 "/" 替换为 "_"
 ```
 
+### 🧹 清理容器日志 (-c)
+
+清空所有容器的 `json.log` 文件以释放磁盘空间：
+
+```bash
+./runlike -c
+```
+
+非 root 运行时会自动提示输入 sudo 密码：
+
+```
+🔒 Root permission required, requesting sudo...
+[sudo] password for user:
+🔍 Docker Root Dir: /var/lib/docker
+📊 Found 5 containers
+
+  1. nginx                id: a1b2c3d4e5f6  log: 128.5 MB
+     ✅ /var/lib/docker/containers/a1b2.../a1b2...-json.log
+  2. redis                id: f6e5d4c3b2a1  log: 32.1 MB
+     ✅ /var/lib/docker/containers/f6e5.../f6e5...-json.log
+
+✅ Done! 2 log files cleaned
+```
+
 ### 📋 全部选项
 
 | 参数 | 说明 |
@@ -139,5 +190,6 @@ go build -ldflags="-s -w" -o runlike main.go
 | `-y`, `--yml` | 输出 Docker Compose YAML 格式 |
 | `-a` | 批量导出所有容器到文件 |
 | `-o <目录>` | `-a` 模式的输出目录（默认 `./`，不存在自动创建） |
+| `-c` | 清空所有容器 json.log 日志（非 root 自动请求 sudo） |
 | `-no-name` | 不包含 `--name` 参数 |
 | `-l` | 不包含 labels |

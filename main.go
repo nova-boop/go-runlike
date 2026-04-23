@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -21,6 +22,7 @@ func main() {
 	flag.BoolVar(ymlMode, "yml", false, "Output in Docker Compose YAML format")
 	bakAll := flag.Bool("a", false, "Export all containers. Use -a -p for shell only, -a -y for yml only, -a for both")
 	outDir := flag.String("o", ".", "Output directory for -a mode (auto-created if not exists)")
+	cleanLogs := flag.Bool("c", false, "Clean all containers' json.log files (truncate to 0)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: runlike [OPTIONS] <container name>\n\nOptions:\n")
@@ -37,6 +39,11 @@ func main() {
 
 	if *bakAll {
 		exportAllContainers(ctx, cli, *noName, *noLabels, *ymlMode, *pretty, *outDir)
+		return
+	}
+
+	if *cleanLogs {
+		cleanDockerLogs(ctx, cli)
 		return
 	}
 
@@ -323,6 +330,88 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 
 func safeFileName(name string) string {
 	return strings.ReplaceAll(name, "/", "_")
+}
+
+func isRoot() bool {
+	return os.Geteuid() == 0
+}
+
+func cleanDockerLogs(ctx context.Context, cli *client.Client) {
+	if !isRoot() {
+		fmt.Println("🔒 Root permission required, requesting sudo...")
+		cmd := exec.Command("sudo", append([]string{os.Args[0]}, os.Args[1:]...)...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	info, err := cli.Info(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to get Docker info: %v\n", err)
+		os.Exit(1)
+	}
+	dockerRoot := info.DockerRootDir
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to list containers: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(containers) == 0 {
+		fmt.Println("No containers found.")
+		return
+	}
+
+	fmt.Printf("🔍 Docker Root Dir: %s\n", dockerRoot)
+	fmt.Printf("📊 Found %d containers\n\n", len(containers))
+
+	cleaned := 0
+	for i, c := range containers {
+		name := strings.TrimPrefix(c.Names[0], "/")
+		id := c.ID
+		logPath := filepath.Join(dockerRoot, "containers", id, id+"-json.log")
+
+		sizeStr := "?"
+		if fi, err := os.Stat(logPath); err == nil {
+			sizeStr = humanSize(fi.Size())
+		} else if os.IsNotExist(err) {
+			continue
+		}
+
+		fmt.Printf("  %d. %-30s  id: %-12s  log: %s\n", i+1, name, id[:12], sizeStr)
+
+		if err := os.Truncate(logPath, 0); err != nil {
+			fmt.Fprintf(os.Stderr, "     ❌ clean failed: %v\n", err)
+			continue
+		}
+		fmt.Printf("     ✅ %s\n", logPath)
+		cleaned++
+	}
+
+	fmt.Printf("\n✅ Done! %d log files cleaned\n", cleaned)
+}
+
+func humanSize(b int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case b >= GB:
+		return fmt.Sprintf("%.2f GB", float64(b)/float64(GB))
+	case b >= MB:
+		return fmt.Sprintf("%.2f MB", float64(b)/float64(MB))
+	case b >= KB:
+		return fmt.Sprintf("%.2f KB", float64(b)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
 
 func exportAllContainers(ctx context.Context, cli *client.Client, noName, noLabels, ymlMode, pretty bool, outDir string) {
