@@ -2,7 +2,7 @@ module my-runlike
 
 go 1.25.0
 
-require github.com/moby/moby v28.5.2+incompatible
+require github.com/docker/docker v28.5.2+incompatible
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
@@ -11,7 +11,6 @@ require (
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
-	github.com/docker/docker v28.5.2+incompatible // indirect
 	github.com/docker/go-connections v0.6.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect

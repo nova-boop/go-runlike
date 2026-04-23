@@ -18,7 +18,7 @@ mkdir -p bin
 
 for target in "${targets[@]}"; do
     IFS="/" read -r os arch <<< "$target"
-    output="bin/runlike_${os}_${arch}"
+    output="bin/runlike-${os}-${arch}"
     [ "$os" == "windows" ] && output+=".exe"
 
     echo "Building: $output ..."
@@ -26,4 +26,3 @@ for target in "${targets[@]}"; do
 done
 
 echo "✅ Build complete! All files are located in the bin/ directory."
-

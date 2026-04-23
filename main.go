@@ -5,10 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/moby/moby/api/types"
-	"github.com/moby/moby/client"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 )
 
 func main() {
@@ -17,18 +19,14 @@ func main() {
 	noLabels := flag.Bool("l", false, "Do not include Labels tags")
 	ymlMode := flag.Bool("y", false, "Output in Docker Compose YAML format")
 	flag.BoolVar(ymlMode, "yml", false, "Output in Docker Compose YAML format")
+	bakAll := flag.Bool("a", false, "Export all containers. Use -a -p for shell only, -a -y for yml only, -a for both")
+	outDir := flag.String("o", ".", "Output directory for -a mode (auto-created if not exists)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: runlike [OPTIONS] <container name>\n\nOptions:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-
-	args := flag.Args()
-	if len(args) < 1 {
-		flag.Usage()
-		return
-	}
 
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -37,37 +35,52 @@ func main() {
 		os.Exit(1)
 	}
 
-	json, err := cli.ContainerInspect(ctx, args[0])
+	if *bakAll {
+		exportAllContainers(ctx, cli, *noName, *noLabels, *ymlMode, *pretty, *outDir)
+		return
+	}
+
+	args := flag.Args()
+	if len(args) < 1 {
+		flag.Usage()
+		return
+	}
+
+	containerJSON, err := cli.ContainerInspect(ctx, args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Container not found: %v\n", err)
 		os.Exit(1)
 	}
 
-	image, _, _ := cli.ImageInspectWithRaw(ctx, json.Image)
-	imageEnvs := make(map[string]bool)
-	imageExposedPorts := make(map[string]bool)
-	var imageWorkDir string
-	if image.Config != nil {
-		for _, e := range image.Config.Env {
-			imageEnvs[e] = true
-		}
-		for p := range image.Config.ExposedPorts {
-			imageExposedPorts[string(p)] = true
-		}
-		imageWorkDir = image.Config.WorkingDir
-	}
-
-	containerName := strings.TrimPrefix(json.Name, "/")
+	imgEnvs, imgExposed, imgWorkDir := inspectImageDefaults(ctx, cli, containerJSON.Image)
+	containerName := strings.TrimPrefix(containerJSON.Name, "/")
 
 	if *ymlMode {
-		renderCompose(&json, containerName, imageEnvs, imageExposedPorts, imageWorkDir, *noLabels)
+		fmt.Println(buildCompose(&containerJSON, containerName, imgEnvs, imgExposed, imgWorkDir, *noLabels))
 	} else {
-		renderShell(&json, containerName, imageEnvs, imageExposedPorts, imageWorkDir, *noName, *noLabels, *pretty)
+		fmt.Println(buildShell(&containerJSON, containerName, imgEnvs, imgExposed, imgWorkDir, *noName, *noLabels, *pretty))
 	}
 }
 
-// renderShell: Output the standard docker run command
-func renderShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noName, noLabels, pretty bool) {
+func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID string) (map[string]bool, map[string]bool, string) {
+	imgEnvs := make(map[string]bool)
+	imgExposed := make(map[string]bool)
+	var imgWorkDir string
+
+	image, _, _ := cli.ImageInspectWithRaw(ctx, imageID)
+	if image.Config != nil {
+		for _, e := range image.Config.Env {
+			imgEnvs[e] = true
+		}
+		for p := range image.Config.ExposedPorts {
+			imgExposed[string(p)] = true
+		}
+		imgWorkDir = image.Config.WorkingDir
+	}
+	return imgEnvs, imgExposed, imgWorkDir
+}
+
+func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noName, noLabels, pretty bool) string {
 	var p []string
 
 	mode := "-"
@@ -177,41 +190,41 @@ func renderShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool
 	if pretty {
 		sep = " \\\n\t"
 	}
-	fmt.Println(strings.Join(p, sep))
+	return strings.Join(p, sep)
 }
 
-// renderCompose: Output modern style Compose YAML
-func renderCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noLabels bool) {
-	fmt.Println("services:")
-	fmt.Printf("  %s:\n", name)
-	fmt.Printf("    image: %s\n", json.Config.Image)
-	fmt.Printf("    container_name: %s\n", name)
+func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noLabels bool) string {
+	var b strings.Builder
+
+	b.WriteString("services:\n")
+	fmt.Fprintf(&b, "  %s:\n", name)
+	fmt.Fprintf(&b, "    image: %s\n", json.Config.Image)
+	fmt.Fprintf(&b, "    container_name: %s\n", name)
 
 	if len(json.NetworkSettings.Networks) > 0 {
-		fmt.Println("    networks:")
+		b.WriteString("    networks:\n")
 		for netName := range json.NetworkSettings.Networks {
-			fmt.Printf("      - %s\n", netName)
+			fmt.Fprintf(&b, "      - %s\n", netName)
 		}
 	}
 
 	if json.Config.Hostname != "" {
-		fmt.Printf("    hostname: %s\n", json.Config.Hostname)
+		fmt.Fprintf(&b, "    hostname: %s\n", json.Config.Hostname)
 	}
 	if json.HostConfig.NetworkMode != "default" {
-		fmt.Printf("    network_mode: %s\n", json.HostConfig.NetworkMode)
+		fmt.Fprintf(&b, "    network_mode: %s\n", json.HostConfig.NetworkMode)
 	}
 
-	// DNS And ExtraHosts
 	if len(json.HostConfig.DNS) > 0 {
-		fmt.Println("    dns:")
+		b.WriteString("    dns:\n")
 		for _, d := range json.HostConfig.DNS {
-			fmt.Printf("      - %s\n", d)
+			fmt.Fprintf(&b, "      - %s\n", d)
 		}
 	}
 	if len(json.HostConfig.ExtraHosts) > 0 {
-		fmt.Println("    extra_hosts:")
+		b.WriteString("    extra_hosts:\n")
 		for _, h := range json.HostConfig.ExtraHosts {
-			fmt.Printf("      - \"%s\"\n", h)
+			fmt.Fprintf(&b, "      - \"%s\"\n", h)
 		}
 	}
 
@@ -226,35 +239,35 @@ func renderCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bo
 		}
 	}
 	if len(exPorts) > 0 {
-		fmt.Println("    expose:")
+		b.WriteString("    expose:\n")
 		for _, p := range exPorts {
-			fmt.Printf("      - \"%s\"\n", p)
+			fmt.Fprintf(&b, "      - \"%s\"\n", p)
 		}
 	}
 	if len(json.HostConfig.PortBindings) > 0 {
-		fmt.Println("    ports:")
-		for p, b := range json.HostConfig.PortBindings {
-			fmt.Printf("      - \"%s:%s\"\n", b[0].HostPort, p)
+		b.WriteString("    ports:\n")
+		for p, bindings := range json.HostConfig.PortBindings {
+			fmt.Fprintf(&b, "      - \"%s:%s\"\n", bindings[0].HostPort, p)
 		}
 	}
 
 	if json.Config.Tty {
-		fmt.Println("    tty: true")
+		b.WriteString("    tty: true\n")
 	}
 	if json.Config.OpenStdin {
-		fmt.Println("    stdin_open: true")
+		b.WriteString("    stdin_open: true\n")
 	}
 	if json.HostConfig.Privileged {
-		fmt.Println("    privileged: true")
+		b.WriteString("    privileged: true\n")
 	}
 	if json.HostConfig.RestartPolicy.Name != "" {
-		fmt.Printf("    restart: %s\n", json.HostConfig.RestartPolicy.Name)
+		fmt.Fprintf(&b, "    restart: %s\n", json.HostConfig.RestartPolicy.Name)
 	}
 
 	if len(json.Mounts) > 0 {
-		fmt.Println("    volumes:")
+		b.WriteString("    volumes:\n")
 		for _, m := range json.Mounts {
-			fmt.Printf("      - %s:%s\n", m.Source, m.Destination)
+			fmt.Fprintf(&b, "      - %s:%s\n", m.Source, m.Destination)
 		}
 	}
 
@@ -265,43 +278,117 @@ func renderCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bo
 		}
 	}
 	if len(customEnvs) > 0 {
-		fmt.Println("    environment:")
+		b.WriteString("    environment:\n")
 		for _, e := range customEnvs {
-			fmt.Printf("      - %s\n", e)
+			fmt.Fprintf(&b, "      - %s\n", e)
 		}
 	}
 
 	if len(json.HostConfig.LogConfig.Config) > 0 {
-		fmt.Println("    logging:")
-		fmt.Printf("      driver: \"%s\"\n", json.HostConfig.LogConfig.Type)
-		fmt.Println("      options:")
+		b.WriteString("    logging:\n")
+		fmt.Fprintf(&b, "      driver: \"%s\"\n", json.HostConfig.LogConfig.Type)
+		b.WriteString("      options:\n")
 		for k, v := range json.HostConfig.LogConfig.Config {
-			fmt.Printf("        %s: \"%s\"\n", k, v)
+			fmt.Fprintf(&b, "        %s: \"%s\"\n", k, v)
 		}
 	}
 	if len(json.HostConfig.Sysctls) > 0 {
-		fmt.Println("    sysctls:")
+		b.WriteString("    sysctls:\n")
 		for k, v := range json.HostConfig.Sysctls {
-			fmt.Printf("      %s: %s\n", k, v)
+			fmt.Fprintf(&b, "      %s: %s\n", k, v)
 		}
 	}
 
 	if !noLabels && len(json.Config.Labels) > 0 {
-		fmt.Println("    labels:")
+		b.WriteString("    labels:\n")
 		for k, v := range json.Config.Labels {
-			fmt.Printf("      %s: \"%s\"\n", k, v)
+			fmt.Fprintf(&b, "      %s: \"%s\"\n", k, v)
 		}
 	}
 
 	if len(json.Config.Cmd) > 0 {
-		fmt.Printf("    command: %s\n", strings.Join(json.Config.Cmd, " "))
+		fmt.Fprintf(&b, "    command: %s\n", strings.Join(json.Config.Cmd, " "))
 	}
 
 	if len(json.NetworkSettings.Networks) > 0 {
-		fmt.Println("\nnetworks:")
+		b.WriteString("\nnetworks:\n")
 		for netName := range json.NetworkSettings.Networks {
-			fmt.Printf("  %s:\n", netName)
-			fmt.Printf("    external: true\n")
+			fmt.Fprintf(&b, "  %s:\n", netName)
+			b.WriteString("    external: true\n")
 		}
 	}
+
+	return b.String()
+}
+
+func safeFileName(name string) string {
+	return strings.ReplaceAll(name, "/", "_")
+}
+
+func exportAllContainers(ctx context.Context, cli *client.Client, noName, noLabels, ymlMode, pretty bool, outDir string) {
+	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to list containers: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(containers) == 0 {
+		fmt.Println("No containers found.")
+		return
+	}
+
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to create output directory %s: %v\n", outDir, err)
+		os.Exit(1)
+	}
+
+	shellOnly := pretty && !ymlMode
+	ymlOnly := ymlMode && !pretty
+
+	if !ymlOnly {
+		shellAllFile, err := os.Create(filepath.Join(outDir, "docker_run_shell.txt"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to create docker_run_shell.txt: %v\n", err)
+			os.Exit(1)
+		}
+		defer shellAllFile.Close()
+
+		for _, c := range containers {
+			name := strings.TrimPrefix(c.Names[0], "/")
+			containerJSON, err := cli.ContainerInspect(ctx, c.ID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Skip %s: inspect failed: %v\n", name, err)
+				continue
+			}
+			imgEnvs, imgExposed, imgWorkDir := inspectImageDefaults(ctx, cli, containerJSON.Image)
+			shellCmd := buildShell(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, noName, noLabels, true)
+			fmt.Fprintf(shellAllFile, "# %s\n%s\n\n", name, shellCmd)
+		}
+		fmt.Printf("✅ %s/docker_run_shell.txt\n", outDir)
+	}
+
+	if !shellOnly {
+		for _, c := range containers {
+			name := strings.TrimPrefix(c.Names[0], "/")
+			containerJSON, err := cli.ContainerInspect(ctx, c.ID)
+			if err != nil {
+				continue
+			}
+			imgEnvs, imgExposed, imgWorkDir := inspectImageDefaults(ctx, cli, containerJSON.Image)
+			ymlContent := buildCompose(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, noLabels)
+
+			fileName := safeFileName(name)
+			perYmlFile, err := os.Create(filepath.Join(outDir, fileName+".yml"))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Skip %s: create .yml failed: %v\n", name, err)
+				continue
+			}
+			perYmlFile.WriteString(ymlContent)
+			perYmlFile.Close()
+
+			fmt.Printf("✅ %s -> %s/%s.yml\n", name, outDir, fileName)
+		}
+	}
+
+	fmt.Printf("\n✅ Done! %d containers exported\n", len(containers))
 }
