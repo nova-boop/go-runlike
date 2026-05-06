@@ -15,13 +15,14 @@ import (
 )
 
 func main() {
-	// 参数定义 / Flag Definitions
+	// 严格核对所有参数定义 / Strict verification of all flag definitions
 	pretty := flag.Bool("p", false, "Format output in shell mode (use backslash for line breaks) / 格式化 Shell 模式输出 (使用反斜杠换行)")
 	noName := flag.Bool("no-name", false, "Do not include the --name parameter / 不包含 --name 参数")
+	// 修复：默认不打印，加 -l 才输出 / Fix: Hidden by default, show only if -l is provided
 	showLabels := flag.Bool("l", false, "Include Labels tags (hidden by default) / 包含 Labels 标签 (默认隐藏)")
 	ymlMode := flag.Bool("y", false, "Output in Docker Compose YAML format / 以 Docker Compose YAML 格式输出")
 	bakAll := flag.Bool("a", false, "Export all containers / 导出所有容器")
-	outDir := flag.String("o", ".", "Output directory for -a mode / 导出目录 (自动创建)")
+	outDir := flag.String("o", ".", "Output directory for -a mode / 导出目录")
 	cleanLogs := flag.Bool("c", false, "Clean all containers' json.log files / 清理所有容器的 json.log 文件")
 
 	flag.Usage = func() {
@@ -37,19 +38,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 1. 批量处理模式 / Batch Processing Mode
+	// 1. -a 批量导出功能 / Batch Export
 	if *bakAll {
 		exportAllContainers(ctx, cli, *noName, *showLabels, *ymlMode, *pretty, *outDir)
 		return
 	}
 
-	// 2. 清理日志模式 / Log Cleaning Mode
+	// 2. -c 清理日志功能 / Clean Logs
 	if *cleanLogs {
 		cleanDockerLogs(ctx, cli)
 		return
 	}
 
-	// 3. 单容器处理模式 / Single Container Mode
+	// 3. 单容器处理 / Single Container
 	args := flag.Args()
 	if len(args) < 1 {
 		flag.Usage()
@@ -72,7 +73,6 @@ func main() {
 	}
 }
 
-// 检查镜像默认值，避免输出冗余配置
 func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID string) (map[string]bool, map[string]bool, string) {
 	imgEnvs := make(map[string]bool)
 	imgExposed := make(map[string]bool)
@@ -91,7 +91,6 @@ func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID strin
 	return imgEnvs, imgExposed, imgWorkDir
 }
 
-// 构建 Shell 启动命令
 func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noName, showLabels, pretty bool) string {
 	var p []string
 
@@ -128,6 +127,12 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	for _, dns := range json.HostConfig.DNS {
 		p = append(p, fmt.Sprintf("--dns=%s", dns))
 	}
+	for _, link := range json.HostConfig.Links {
+		parts := strings.Split(link, ":")
+		src := strings.TrimPrefix(parts[0], "/")
+		alias := strings.Split(parts[1], "/")[2]
+		p = append(p, fmt.Sprintf("--link %s:%s", src, alias))
+	}
 	for _, host := range json.HostConfig.ExtraHosts {
 		p = append(p, fmt.Sprintf("--add-host=%s", host))
 	}
@@ -139,7 +144,7 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, "--privileged")
 	}
 
-	// 端口映射：Host 模式下自动忽略
+	// 端口逻辑：Host 模式不输出端口映射
 	if netMode != "host" {
 		published := make(map[string]bool)
 		for port, bindings := range json.HostConfig.PortBindings {
@@ -210,7 +215,6 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	return strings.Join(p, sep)
 }
 
-// 构建 Compose YAML 配置
 func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, showLabels bool) string {
 	var b strings.Builder
 
@@ -219,7 +223,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	fmt.Fprintf(&b, "    image: %s\n", json.Config.Image)
 	fmt.Fprintf(&b, "    container_name: %s\n", name)
 
-	// 网络模式判定逻辑：host 模式 vs networks 模式
+	// 网络二选一逻辑修复 / Fix: Exclusive logic between network_mode and networks
 	netMode := string(json.HostConfig.NetworkMode)
 	isSpecialNet := netMode == "host" || netMode == "none" || strings.HasPrefix(netMode, "container:")
 
@@ -339,7 +343,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    command: %s\n", strings.Join(json.Config.Cmd, " "))
 	}
 
-	// 外部网络声明
+	// 外部网络声明定义 / Declare external networks
 	if !isSpecialNet {
 		hasCustomNet := false
 		for netName := range json.NetworkSettings.Networks {
@@ -362,6 +366,24 @@ func safeFileName(name string) string {
 
 func isRoot() bool {
 	return os.Geteuid() == 0
+}
+
+func humanSize(b int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case b >= GB:
+		return fmt.Sprintf("%.2f GB", float64(b)/float64(GB))
+	case b >= MB:
+		return fmt.Sprintf("%.2f MB", float64(b)/float64(MB))
+	case b >= KB:
+		return fmt.Sprintf("%.2f KB", float64(b)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
 
 func cleanDockerLogs(ctx context.Context, cli *client.Client) {
@@ -390,13 +412,35 @@ func cleanDockerLogs(ctx context.Context, cli *client.Client) {
 		os.Exit(1)
 	}
 
+	if len(containers) == 0 {
+		fmt.Println("No containers found (未找到任何容器).")
+		return
+	}
+
+	fmt.Printf("🔍 Docker Root Dir (Docker 根目录): %s\n", dockerRoot)
+	fmt.Printf("📊 Found %d containers (共发现 %d 个容器)\n\n", len(containers), len(containers))
+
 	cleaned := 0
-	for _, c := range containers {
+	for i, c := range containers {
+		name := strings.TrimPrefix(c.Names[0], "/")
 		id := c.ID
 		logPath := filepath.Join(dockerRoot, "containers", id, id+"-json.log")
-		if err := os.Truncate(logPath, 0); err == nil {
-			cleaned++
+
+		sizeStr := "N/A"
+		if fi, err := os.Stat(logPath); err == nil {
+			sizeStr = humanSize(fi.Size())
+		} else if os.IsNotExist(err) {
+			continue
 		}
+
+		fmt.Printf("  %d. %-30s  id: %-12s  log: %s\n", i+1, name, id[:12], sizeStr)
+
+		if err := os.Truncate(logPath, 0); err != nil {
+			fmt.Fprintf(os.Stderr, "     ❌ Clean failed (清理失败): %v\n", err)
+			continue
+		}
+		fmt.Printf("     ✅ Cleared (已清理): %s\n", logPath)
+		cleaned++
 	}
 	fmt.Printf("\n✅ Done! %d log files cleaned (清理完成! 共处理 %d 个日志文件)\n", cleaned, cleaned)
 }
