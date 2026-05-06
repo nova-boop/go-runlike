@@ -15,16 +15,17 @@ import (
 )
 
 func main() {
-	pretty := flag.Bool("p", false, "Format output in shell mode (use backslash for line breaks)")
-	noName := flag.Bool("no-name", false, "Do not include the --name parameter")
-	showLabels := flag.Bool("l", false, "Include Labels tags (hidden by default)")
-	ymlMode := flag.Bool("y", false, "Output in Docker Compose YAML format")
-	bakAll := flag.Bool("a", false, "Export all containers. Use -a -p for shell, -a -y for yml")
-	outDir := flag.String("o", ".", "Output directory for -a mode")
-	cleanLogs := flag.Bool("c", false, "Clean all containers' json.log files")
+	// 参数定义 / Flag Definitions
+	pretty := flag.Bool("p", false, "Format output in shell mode (use backslash for line breaks) / 格式化 Shell 模式输出 (使用反斜杠换行)")
+	noName := flag.Bool("no-name", false, "Do not include the --name parameter / 不包含 --name 参数")
+	showLabels := flag.Bool("l", false, "Include Labels tags (hidden by default) / 包含 Labels 标签 (默认隐藏)")
+	ymlMode := flag.Bool("y", false, "Output in Docker Compose YAML format / 以 Docker Compose YAML 格式输出")
+	bakAll := flag.Bool("a", false, "Export all containers / 导出所有容器")
+	outDir := flag.String("o", ".", "Output directory for -a mode / 导出目录 (自动创建)")
+	cleanLogs := flag.Bool("c", false, "Clean all containers' json.log files / 清理所有容器的 json.log 文件")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: runlike [OPTIONS] <container name>\n\nOptions:\n")
+		fmt.Fprintf(os.Stderr, "Usage / 用法: runlike [OPTIONS] <container name>\n\nOptions / 选项:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -32,20 +33,23 @@ func main() {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to connect to Docker: %v\n", err)
+		fmt.Fprintf(os.Stderr, "❌ Failed to connect to Docker (无法连接到 Docker): %v\n", err)
 		os.Exit(1)
 	}
 
+	// 1. 批量处理模式 / Batch Processing Mode
 	if *bakAll {
 		exportAllContainers(ctx, cli, *noName, *showLabels, *ymlMode, *pretty, *outDir)
 		return
 	}
 
+	// 2. 清理日志模式 / Log Cleaning Mode
 	if *cleanLogs {
 		cleanDockerLogs(ctx, cli)
 		return
 	}
 
+	// 3. 单容器处理模式 / Single Container Mode
 	args := flag.Args()
 	if len(args) < 1 {
 		flag.Usage()
@@ -54,7 +58,7 @@ func main() {
 
 	containerJSON, err := cli.ContainerInspect(ctx, args[0])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Container not found: %v\n", err)
+		fmt.Fprintf(os.Stderr, "❌ Container not found (找不到容器): %v\n", err)
 		os.Exit(1)
 	}
 
@@ -68,13 +72,14 @@ func main() {
 	}
 }
 
+// 检查镜像默认值，避免输出冗余配置
 func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID string) (map[string]bool, map[string]bool, string) {
 	imgEnvs := make(map[string]bool)
 	imgExposed := make(map[string]bool)
 	var imgWorkDir string
 
-	image, _, _ := cli.ImageInspectWithRaw(ctx, imageID)
-	if image.Config != nil {
+	image, _, err := cli.ImageInspectWithRaw(ctx, imageID)
+	if err == nil && image.Config != nil {
 		for _, e := range image.Config.Env {
 			imgEnvs[e] = true
 		}
@@ -86,6 +91,7 @@ func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID strin
 	return imgEnvs, imgExposed, imgWorkDir
 }
 
+// 构建 Shell 启动命令
 func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noName, showLabels, pretty bool) string {
 	var p []string
 
@@ -110,7 +116,9 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--name=%s", name))
 	}
 
-	p = append(p, fmt.Sprintf("--hostname=%s", json.Config.Hostname))
+	if json.Config.Hostname != "" {
+		p = append(p, fmt.Sprintf("--hostname=%s", json.Config.Hostname))
+	}
 
 	netMode := string(json.HostConfig.NetworkMode)
 	if netMode != "default" && netMode != "" {
@@ -131,6 +139,7 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, "--privileged")
 	}
 
+	// 端口映射：Host 模式下自动忽略
 	if netMode != "host" {
 		published := make(map[string]bool)
 		for port, bindings := range json.HostConfig.PortBindings {
@@ -154,6 +163,16 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("-v %s:%s", m.Source, m.Destination))
 	}
 
+	if json.HostConfig.ShmSize > 0 && json.HostConfig.ShmSize != 67108864 {
+		p = append(p, fmt.Sprintf("--shm-size=%d", json.HostConfig.ShmSize))
+	}
+	for key, val := range json.HostConfig.Sysctls {
+		p = append(p, fmt.Sprintf("--sysctl %s=%s", key, val))
+	}
+	for _, dev := range json.HostConfig.Resources.Devices {
+		p = append(p, fmt.Sprintf("--device %s:%s", dev.PathOnHost, dev.PathInContainer))
+	}
+
 	if json.Config.WorkingDir != "" && json.Config.WorkingDir != imgWorkDir {
 		p = append(p, fmt.Sprintf("--workdir=%s", json.Config.WorkingDir))
 	}
@@ -167,8 +186,10 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--restart=%s", json.HostConfig.RestartPolicy.Name))
 	}
 
-	for key, val := range json.HostConfig.LogConfig.Config {
-		p = append(p, fmt.Sprintf("--log-opt %s=%s", key, val))
+	if len(json.HostConfig.LogConfig.Config) > 0 {
+		for key, val := range json.HostConfig.LogConfig.Config {
+			p = append(p, fmt.Sprintf("--log-opt %s=%s", key, val))
+		}
 	}
 
 	if showLabels {
@@ -189,6 +210,7 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	return strings.Join(p, sep)
 }
 
+// 构建 Compose YAML 配置
 func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, showLabels bool) string {
 	var b strings.Builder
 
@@ -197,6 +219,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	fmt.Fprintf(&b, "    image: %s\n", json.Config.Image)
 	fmt.Fprintf(&b, "    container_name: %s\n", name)
 
+	// 网络模式判定逻辑：host 模式 vs networks 模式
 	netMode := string(json.HostConfig.NetworkMode)
 	isSpecialNet := netMode == "host" || netMode == "none" || strings.HasPrefix(netMode, "container:")
 
@@ -235,6 +258,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
+	// 端口逻辑：Host 模式跳过端口映射
 	if !isSpecialNet && len(json.HostConfig.PortBindings) > 0 {
 		b.WriteString("    ports:\n")
 		for p, bindings := range json.HostConfig.PortBindings {
@@ -267,6 +291,10 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		for _, m := range json.Mounts {
 			fmt.Fprintf(&b, "      - %s:%s\n", m.Source, m.Destination)
 		}
+	}
+
+	if json.HostConfig.ShmSize > 0 && json.HostConfig.ShmSize != 67108864 {
+		fmt.Fprintf(&b, "    shm_size: %d\n", json.HostConfig.ShmSize)
 	}
 
 	var customEnvs []string
@@ -311,6 +339,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    command: %s\n", strings.Join(json.Config.Cmd, " "))
 	}
 
+	// 外部网络声明
 	if !isSpecialNet {
 		hasCustomNet := false
 		for netName := range json.NetworkSettings.Networks {
@@ -337,7 +366,7 @@ func isRoot() bool {
 
 func cleanDockerLogs(ctx context.Context, cli *client.Client) {
 	if !isRoot() {
-		fmt.Println("🔒 Root permission required, requesting sudo...")
+		fmt.Println("🔒 Root permission required, requesting via sudo (需要 Root 权限，正在尝试通过 sudo 运行)...")
 		cmd := exec.Command("sudo", append([]string{os.Args[0]}, os.Args[1:]...)...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
@@ -350,14 +379,14 @@ func cleanDockerLogs(ctx context.Context, cli *client.Client) {
 
 	info, err := cli.Info(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to get Docker info: %v\n", err)
+		fmt.Fprintf(os.Stderr, "❌ Failed to get Docker info (获取 Docker 信息失败): %v\n", err)
 		os.Exit(1)
 	}
 	dockerRoot := info.DockerRootDir
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to list containers: %v\n", err)
+		fmt.Fprintf(os.Stderr, "❌ Failed to list containers (列出容器失败): %v\n", err)
 		os.Exit(1)
 	}
 
@@ -369,34 +398,70 @@ func cleanDockerLogs(ctx context.Context, cli *client.Client) {
 			cleaned++
 		}
 	}
-	fmt.Printf("\n✅ Done! %d log files cleaned\n", cleaned)
+	fmt.Printf("\n✅ Done! %d log files cleaned (清理完成! 共处理 %d 个日志文件)\n", cleaned, cleaned)
 }
 
 func exportAllContainers(ctx context.Context, cli *client.Client, noName, showLabels, ymlMode, pretty bool, outDir string) {
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to list containers: %v\n", err)
+		fmt.Fprintf(os.Stderr, "❌ Failed to list containers (列出容器失败): %v\n", err)
 		os.Exit(1)
 	}
 
+	if len(containers) == 0 {
+		fmt.Println("No containers found (未找到任何容器).")
+		return
+	}
+
 	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to create directory (创建目录失败) %s: %v\n", outDir, err)
 		os.Exit(1)
 	}
+
+	doShell := pretty || (!ymlMode && !pretty)
+	doYml := ymlMode || (!ymlMode && !pretty)
+
+	var shellFile *os.File
+	if doShell {
+		var err error
+		shellFile, err = os.Create(filepath.Join(outDir, "docker_run_shell.txt"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to create combined shell file (创建 Shell 汇总文件失败): %v\n", err)
+			return
+		}
+		defer shellFile.Close()
+	}
+
+	fmt.Printf("📂 Exporting to (正在导出至): %s\n", outDir)
 
 	for _, c := range containers {
 		name := strings.TrimPrefix(c.Names[0], "/")
 		containerJSON, err := cli.ContainerInspect(ctx, c.ID)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "⚠️  Skip %s: Inspect failed (获取配置失败): %v\n", name, err)
 			continue
 		}
 		imgEnvs, imgExposed, imgWorkDir := inspectImageDefaults(ctx, cli, containerJSON.Image)
 
-		if ymlMode {
-			content := buildCompose(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, showLabels)
-			os.WriteFile(filepath.Join(outDir, safeFileName(name)+".yml"), []byte(content), 0644)
-		} else {
-			content := buildShell(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, noName, showLabels, pretty)
-			fmt.Println(content)
+		if doYml {
+			ymlContent := buildCompose(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, showLabels)
+			fileName := safeFileName(name) + ".yml"
+			err := os.WriteFile(filepath.Join(outDir, fileName), []byte(ymlContent), 0644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Failed to save YML (保存 YML 失败) %s: %v\n", name, err)
+			} else {
+				fmt.Printf("✅ %-20s -> %s\n", name, fileName)
+			}
+		}
+
+		if doShell {
+			shellCmd := buildShell(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, noName, showLabels, true)
+			fmt.Fprintf(shellFile, "# Container (容器): %s\n%s\n\n", name, shellCmd)
 		}
 	}
+
+	if doShell {
+		fmt.Printf("✅ Combined shell script saved (Shell 汇总已保存至): docker_run_shell.txt\n")
+	}
+	fmt.Printf("\n✨ Export Finished (导出完成)!\n")
 }
