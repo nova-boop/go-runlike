@@ -167,6 +167,10 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--restart=%s", json.HostConfig.RestartPolicy.Name))
 	}
 
+	for key, val := range json.HostConfig.LogConfig.Config {
+		p = append(p, fmt.Sprintf("--log-opt %s=%s", key, val))
+	}
+
 	if showLabels {
 		for k, v := range json.Config.Labels {
 			p = append(p, fmt.Sprintf("--label='%s=%s'", k, v))
@@ -217,6 +221,20 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    hostname: %s\n", json.Config.Hostname)
 	}
 
+	if len(json.HostConfig.DNS) > 0 {
+		b.WriteString("    dns:\n")
+		for _, dns := range json.HostConfig.DNS {
+			fmt.Fprintf(&b, "      - %s\n", dns)
+		}
+	}
+
+	if len(json.HostConfig.ExtraHosts) > 0 {
+		b.WriteString("    extra_hosts:\n")
+		for _, host := range json.HostConfig.ExtraHosts {
+			fmt.Fprintf(&b, "      - \"%s\"\n", host)
+		}
+	}
+
 	if !isSpecialNet && len(json.HostConfig.PortBindings) > 0 {
 		b.WriteString("    ports:\n")
 		for p, bindings := range json.HostConfig.PortBindings {
@@ -264,6 +282,24 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
+	if json.HostConfig.LogConfig.Type != "" && json.HostConfig.LogConfig.Type != "none" {
+		b.WriteString("    logging:\n")
+		fmt.Fprintf(&b, "      driver: \"%s\"\n", json.HostConfig.LogConfig.Type)
+		if len(json.HostConfig.LogConfig.Config) > 0 {
+			b.WriteString("      options:\n")
+			for k, v := range json.HostConfig.LogConfig.Config {
+				fmt.Fprintf(&b, "        %s: \"%s\"\n", k, v)
+			}
+		}
+	}
+
+	if len(json.HostConfig.Sysctls) > 0 {
+		b.WriteString("    sysctls:\n")
+		for k, v := range json.HostConfig.Sysctls {
+			fmt.Fprintf(&b, "      %s: %s\n", k, v)
+		}
+	}
+
 	if showLabels && len(json.Config.Labels) > 0 {
 		b.WriteString("    labels:\n")
 		for k, v := range json.Config.Labels {
@@ -275,7 +311,6 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    command: %s\n", strings.Join(json.Config.Cmd, " "))
 	}
 
-	// 外部网络声明
 	if !isSpecialNet {
 		hasCustomNet := false
 		for netName := range json.NetworkSettings.Networks {
