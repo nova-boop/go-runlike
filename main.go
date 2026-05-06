@@ -17,12 +17,11 @@ import (
 func main() {
 	pretty := flag.Bool("p", false, "Format output in shell mode (use backslash for line breaks)")
 	noName := flag.Bool("no-name", false, "Do not include the --name parameter")
-	noLabels := flag.Bool("l", false, "Do not include Labels tags")
+	showLabels := flag.Bool("l", false, "Include Labels tags (hidden by default)")
 	ymlMode := flag.Bool("y", false, "Output in Docker Compose YAML format")
-	flag.BoolVar(ymlMode, "yml", false, "Output in Docker Compose YAML format")
-	bakAll := flag.Bool("a", false, "Export all containers. Use -a -p for shell only, -a -y for yml only, -a for both")
-	outDir := flag.String("o", ".", "Output directory for -a mode (auto-created if not exists)")
-	cleanLogs := flag.Bool("c", false, "Clean all containers' json.log files (truncate to 0)")
+	bakAll := flag.Bool("a", false, "Export all containers. Use -a -p for shell, -a -y for yml")
+	outDir := flag.String("o", ".", "Output directory for -a mode")
+	cleanLogs := flag.Bool("c", false, "Clean all containers' json.log files")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: runlike [OPTIONS] <container name>\n\nOptions:\n")
@@ -38,7 +37,7 @@ func main() {
 	}
 
 	if *bakAll {
-		exportAllContainers(ctx, cli, *noName, *noLabels, *ymlMode, *pretty, *outDir)
+		exportAllContainers(ctx, cli, *noName, *showLabels, *ymlMode, *pretty, *outDir)
 		return
 	}
 
@@ -63,9 +62,9 @@ func main() {
 	containerName := strings.TrimPrefix(containerJSON.Name, "/")
 
 	if *ymlMode {
-		fmt.Println(buildCompose(&containerJSON, containerName, imgEnvs, imgExposed, imgWorkDir, *noLabels))
+		fmt.Println(buildCompose(&containerJSON, containerName, imgEnvs, imgExposed, imgWorkDir, *showLabels))
 	} else {
-		fmt.Println(buildShell(&containerJSON, containerName, imgEnvs, imgExposed, imgWorkDir, *noName, *noLabels, *pretty))
+		fmt.Println(buildShell(&containerJSON, containerName, imgEnvs, imgExposed, imgWorkDir, *noName, *showLabels, *pretty))
 	}
 }
 
@@ -87,7 +86,7 @@ func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID strin
 	return imgEnvs, imgExposed, imgWorkDir
 }
 
-func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noName, noLabels, pretty bool) string {
+func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noName, showLabels, pretty bool) string {
 	var p []string
 
 	mode := "-"
@@ -112,18 +111,14 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	}
 
 	p = append(p, fmt.Sprintf("--hostname=%s", json.Config.Hostname))
-	if json.HostConfig.NetworkMode != "default" {
-		p = append(p, fmt.Sprintf("--network=%s", json.HostConfig.NetworkMode))
+
+	netMode := string(json.HostConfig.NetworkMode)
+	if netMode != "default" && netMode != "" {
+		p = append(p, fmt.Sprintf("--network=%s", netMode))
 	}
 
 	for _, dns := range json.HostConfig.DNS {
 		p = append(p, fmt.Sprintf("--dns=%s", dns))
-	}
-	for _, link := range json.HostConfig.Links {
-		parts := strings.Split(link, ":")
-		src := strings.TrimPrefix(parts[0], "/")
-		alias := strings.Split(parts[1], "/")[2]
-		p = append(p, fmt.Sprintf("--link %s:%s", src, alias))
 	}
 	for _, host := range json.HostConfig.ExtraHosts {
 		p = append(p, fmt.Sprintf("--add-host=%s", host))
@@ -136,31 +131,27 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, "--privileged")
 	}
 
-	published := make(map[string]bool)
-	for port, bindings := range json.HostConfig.PortBindings {
-		published[string(port)] = true
-		for _, b := range bindings {
-			if b.HostIP == "" || b.HostIP == "0.0.0.0" {
-				p = append(p, fmt.Sprintf("-p %s:%s", b.HostPort, port))
-			} else {
-				p = append(p, fmt.Sprintf("-p %s:%s:%s", b.HostIP, b.HostPort, port))
+	if netMode != "host" {
+		published := make(map[string]bool)
+		for port, bindings := range json.HostConfig.PortBindings {
+			published[string(port)] = true
+			for _, b := range bindings {
+				if b.HostIP == "" || b.HostIP == "0.0.0.0" {
+					p = append(p, fmt.Sprintf("-p %s:%s", b.HostPort, port))
+				} else {
+					p = append(p, fmt.Sprintf("-p %s:%s:%s", b.HostIP, b.HostPort, port))
+				}
 			}
 		}
-	}
-	for port := range json.Config.ExposedPorts {
-		if !imgExposed[string(port)] && !published[string(port)] {
-			p = append(p, fmt.Sprintf("--expose=%s", port))
+		for port := range json.Config.ExposedPorts {
+			if !imgExposed[string(port)] && !published[string(port)] {
+				p = append(p, fmt.Sprintf("--expose=%s", port))
+			}
 		}
 	}
 
 	for _, m := range json.Mounts {
 		p = append(p, fmt.Sprintf("-v %s:%s", m.Source, m.Destination))
-	}
-	if json.HostConfig.ShmSize > 0 && json.HostConfig.ShmSize != 67108864 {
-		p = append(p, fmt.Sprintf("--shm-size=%d", json.HostConfig.ShmSize))
-	}
-	for key, val := range json.HostConfig.Sysctls {
-		p = append(p, fmt.Sprintf("--sysctl %s=%s", key, val))
 	}
 
 	if json.Config.WorkingDir != "" && json.Config.WorkingDir != imgWorkDir {
@@ -175,14 +166,8 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	if json.HostConfig.RestartPolicy.Name != "" {
 		p = append(p, fmt.Sprintf("--restart=%s", json.HostConfig.RestartPolicy.Name))
 	}
-	for key, val := range json.HostConfig.LogConfig.Config {
-		p = append(p, fmt.Sprintf("--log-opt %s=%s", key, val))
-	}
-	for _, dev := range json.HostConfig.Resources.Devices {
-		p = append(p, fmt.Sprintf("--device %s:%s", dev.PathOnHost, dev.PathInContainer))
-	}
 
-	if !noLabels {
+	if showLabels {
 		for k, v := range json.Config.Labels {
 			p = append(p, fmt.Sprintf("--label='%s=%s'", k, v))
 		}
@@ -200,7 +185,7 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	return strings.Join(p, sep)
 }
 
-func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noLabels bool) string {
+func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, showLabels bool) string {
 	var b strings.Builder
 
 	b.WriteString("services:\n")
@@ -208,53 +193,40 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	fmt.Fprintf(&b, "    image: %s\n", json.Config.Image)
 	fmt.Fprintf(&b, "    container_name: %s\n", name)
 
-	if len(json.NetworkSettings.Networks) > 0 {
-		b.WriteString("    networks:\n")
+	netMode := string(json.HostConfig.NetworkMode)
+	isSpecialNet := netMode == "host" || netMode == "none" || strings.HasPrefix(netMode, "container:")
+
+	if isSpecialNet {
+		fmt.Fprintf(&b, "    network_mode: %s\n", netMode)
+	} else {
+		var customNets []string
 		for netName := range json.NetworkSettings.Networks {
-			fmt.Fprintf(&b, "      - %s\n", netName)
+			if netName != "bridge" && netName != "default" {
+				customNets = append(customNets, netName)
+			}
+		}
+		if len(customNets) > 0 {
+			b.WriteString("    networks:\n")
+			for _, netName := range customNets {
+				fmt.Fprintf(&b, "      - %s\n", netName)
+			}
 		}
 	}
 
 	if json.Config.Hostname != "" {
 		fmt.Fprintf(&b, "    hostname: %s\n", json.Config.Hostname)
 	}
-	if json.HostConfig.NetworkMode != "default" {
-		fmt.Fprintf(&b, "    network_mode: %s\n", json.HostConfig.NetworkMode)
-	}
 
-	if len(json.HostConfig.DNS) > 0 {
-		b.WriteString("    dns:\n")
-		for _, d := range json.HostConfig.DNS {
-			fmt.Fprintf(&b, "      - %s\n", d)
-		}
-	}
-	if len(json.HostConfig.ExtraHosts) > 0 {
-		b.WriteString("    extra_hosts:\n")
-		for _, h := range json.HostConfig.ExtraHosts {
-			fmt.Fprintf(&b, "      - \"%s\"\n", h)
-		}
-	}
-
-	published := make(map[string]bool)
-	for p := range json.HostConfig.PortBindings {
-		published[string(p)] = true
-	}
-	var exPorts []string
-	for p := range json.Config.ExposedPorts {
-		if !imgExposed[string(p)] && !published[string(p)] {
-			exPorts = append(exPorts, string(p))
-		}
-	}
-	if len(exPorts) > 0 {
-		b.WriteString("    expose:\n")
-		for _, p := range exPorts {
-			fmt.Fprintf(&b, "      - \"%s\"\n", p)
-		}
-	}
-	if len(json.HostConfig.PortBindings) > 0 {
+	if !isSpecialNet && len(json.HostConfig.PortBindings) > 0 {
 		b.WriteString("    ports:\n")
 		for p, bindings := range json.HostConfig.PortBindings {
-			fmt.Fprintf(&b, "      - \"%s:%s\"\n", bindings[0].HostPort, p)
+			for _, bind := range bindings {
+				if bind.HostIP != "" && bind.HostIP != "0.0.0.0" {
+					fmt.Fprintf(&b, "      - \"%s:%s:%s\"\n", bind.HostIP, bind.HostPort, p)
+				} else {
+					fmt.Fprintf(&b, "      - \"%s:%s\"\n", bind.HostPort, p)
+				}
+			}
 		}
 	}
 
@@ -267,6 +239,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	if json.HostConfig.Privileged {
 		b.WriteString("    privileged: true\n")
 	}
+
 	if json.HostConfig.RestartPolicy.Name != "" {
 		fmt.Fprintf(&b, "    restart: %s\n", json.HostConfig.RestartPolicy.Name)
 	}
@@ -291,22 +264,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
-	if len(json.HostConfig.LogConfig.Config) > 0 {
-		b.WriteString("    logging:\n")
-		fmt.Fprintf(&b, "      driver: \"%s\"\n", json.HostConfig.LogConfig.Type)
-		b.WriteString("      options:\n")
-		for k, v := range json.HostConfig.LogConfig.Config {
-			fmt.Fprintf(&b, "        %s: \"%s\"\n", k, v)
-		}
-	}
-	if len(json.HostConfig.Sysctls) > 0 {
-		b.WriteString("    sysctls:\n")
-		for k, v := range json.HostConfig.Sysctls {
-			fmt.Fprintf(&b, "      %s: %s\n", k, v)
-		}
-	}
-
-	if !noLabels && len(json.Config.Labels) > 0 {
+	if showLabels && len(json.Config.Labels) > 0 {
 		b.WriteString("    labels:\n")
 		for k, v := range json.Config.Labels {
 			fmt.Fprintf(&b, "      %s: \"%s\"\n", k, v)
@@ -317,11 +275,17 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    command: %s\n", strings.Join(json.Config.Cmd, " "))
 	}
 
-	if len(json.NetworkSettings.Networks) > 0 {
-		b.WriteString("\nnetworks:\n")
+	// 外部网络声明
+	if !isSpecialNet {
+		hasCustomNet := false
 		for netName := range json.NetworkSettings.Networks {
-			fmt.Fprintf(&b, "  %s:\n", netName)
-			b.WriteString("    external: true\n")
+			if netName != "bridge" && netName != "default" {
+				if !hasCustomNet {
+					b.WriteString("\nnetworks:\n")
+					hasCustomNet = true
+				}
+				fmt.Fprintf(&b, "  %s:\n    external: true\n", netName)
+			}
 		}
 	}
 
@@ -362,122 +326,42 @@ func cleanDockerLogs(ctx context.Context, cli *client.Client) {
 		os.Exit(1)
 	}
 
-	if len(containers) == 0 {
-		fmt.Println("No containers found.")
-		return
-	}
-
-	fmt.Printf("🔍 Docker Root Dir: %s\n", dockerRoot)
-	fmt.Printf("📊 Found %d containers\n\n", len(containers))
-
 	cleaned := 0
-	for i, c := range containers {
-		name := strings.TrimPrefix(c.Names[0], "/")
+	for _, c := range containers {
 		id := c.ID
 		logPath := filepath.Join(dockerRoot, "containers", id, id+"-json.log")
-
-		sizeStr := "?"
-		if fi, err := os.Stat(logPath); err == nil {
-			sizeStr = humanSize(fi.Size())
-		} else if os.IsNotExist(err) {
-			continue
+		if err := os.Truncate(logPath, 0); err == nil {
+			cleaned++
 		}
-
-		fmt.Printf("  %d. %-30s  id: %-12s  log: %s\n", i+1, name, id[:12], sizeStr)
-
-		if err := os.Truncate(logPath, 0); err != nil {
-			fmt.Fprintf(os.Stderr, "     ❌ clean failed: %v\n", err)
-			continue
-		}
-		fmt.Printf("     ✅ %s\n", logPath)
-		cleaned++
 	}
-
 	fmt.Printf("\n✅ Done! %d log files cleaned\n", cleaned)
 }
 
-func humanSize(b int64) string {
-	const (
-		KB = 1024
-		MB = KB * 1024
-		GB = MB * 1024
-	)
-	switch {
-	case b >= GB:
-		return fmt.Sprintf("%.2f GB", float64(b)/float64(GB))
-	case b >= MB:
-		return fmt.Sprintf("%.2f MB", float64(b)/float64(MB))
-	case b >= KB:
-		return fmt.Sprintf("%.2f KB", float64(b)/float64(KB))
-	default:
-		return fmt.Sprintf("%d B", b)
-	}
-}
-
-func exportAllContainers(ctx context.Context, cli *client.Client, noName, noLabels, ymlMode, pretty bool, outDir string) {
+func exportAllContainers(ctx context.Context, cli *client.Client, noName, showLabels, ymlMode, pretty bool, outDir string) {
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to list containers: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(containers) == 0 {
-		fmt.Println("No containers found.")
-		return
-	}
-
 	if err := os.MkdirAll(outDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to create output directory %s: %v\n", outDir, err)
 		os.Exit(1)
 	}
 
-	shellOnly := pretty && !ymlMode
-	ymlOnly := ymlMode && !pretty
-
-	if !ymlOnly {
-		shellAllFile, err := os.Create(filepath.Join(outDir, "docker_run_shell.txt"))
+	for _, c := range containers {
+		name := strings.TrimPrefix(c.Names[0], "/")
+		containerJSON, err := cli.ContainerInspect(ctx, c.ID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to create docker_run_shell.txt: %v\n", err)
-			os.Exit(1)
+			continue
 		}
-		defer shellAllFile.Close()
+		imgEnvs, imgExposed, imgWorkDir := inspectImageDefaults(ctx, cli, containerJSON.Image)
 
-		for _, c := range containers {
-			name := strings.TrimPrefix(c.Names[0], "/")
-			containerJSON, err := cli.ContainerInspect(ctx, c.ID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "⚠️  Skip %s: inspect failed: %v\n", name, err)
-				continue
-			}
-			imgEnvs, imgExposed, imgWorkDir := inspectImageDefaults(ctx, cli, containerJSON.Image)
-			shellCmd := buildShell(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, noName, noLabels, true)
-			fmt.Fprintf(shellAllFile, "# %s\n%s\n\n", name, shellCmd)
-		}
-		fmt.Printf("✅ %s/docker_run_shell.txt\n", outDir)
-	}
-
-	if !shellOnly {
-		for _, c := range containers {
-			name := strings.TrimPrefix(c.Names[0], "/")
-			containerJSON, err := cli.ContainerInspect(ctx, c.ID)
-			if err != nil {
-				continue
-			}
-			imgEnvs, imgExposed, imgWorkDir := inspectImageDefaults(ctx, cli, containerJSON.Image)
-			ymlContent := buildCompose(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, noLabels)
-
-			fileName := safeFileName(name)
-			perYmlFile, err := os.Create(filepath.Join(outDir, fileName+".yml"))
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "⚠️  Skip %s: create .yml failed: %v\n", name, err)
-				continue
-			}
-			perYmlFile.WriteString(ymlContent)
-			perYmlFile.Close()
-
-			fmt.Printf("✅ %s -> %s/%s.yml\n", name, outDir, fileName)
+		if ymlMode {
+			content := buildCompose(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, showLabels)
+			os.WriteFile(filepath.Join(outDir, safeFileName(name)+".yml"), []byte(content), 0644)
+		} else {
+			content := buildShell(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, noName, showLabels, pretty)
+			fmt.Println(content)
 		}
 	}
-
-	fmt.Printf("\n✅ Done! %d containers exported\n", len(containers))
 }
