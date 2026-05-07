@@ -115,15 +115,24 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--name=%s", name))
 	}
 
+	// Hostname, Entrypoint
 	if json.Config.Hostname != "" {
 		p = append(p, fmt.Sprintf("--hostname=%s", json.Config.Hostname))
 	}
+	if len(json.Config.Entrypoint) > 0 {
+		p = append(p, fmt.Sprintf("--entrypoint=\"%s\"", strings.Join(json.Config.Entrypoint, " ")))
+	}
 
+	// Network
 	netMode := string(json.HostConfig.NetworkMode)
 	if netMode != "default" && netMode != "" {
 		p = append(p, fmt.Sprintf("--network=%s", netMode))
 	}
+	if json.Config.MacAddress != "" {
+		p = append(p, fmt.Sprintf("--mac-address=%s", json.Config.MacAddress))
+	}
 
+	// DNS, Links, Extra Hosts
 	for _, dns := range json.HostConfig.DNS {
 		p = append(p, fmt.Sprintf("--dns=%s", dns))
 	}
@@ -137,11 +146,26 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--add-host=%s", host))
 	}
 
+	// User, Privileged, Init
 	if json.Config.User != "" {
 		p = append(p, fmt.Sprintf("--user=%s", json.Config.User))
 	}
 	if json.HostConfig.Privileged {
 		p = append(p, "--privileged")
+	}
+	if json.HostConfig.Init != nil && *json.HostConfig.Init {
+		p = append(p, "--init")
+	}
+
+	// Capabilities & Security
+	for _, cap := range json.HostConfig.CapAdd {
+		p = append(p, fmt.Sprintf("--cap-add=%s", cap))
+	}
+	for _, cap := range json.HostConfig.CapDrop {
+		p = append(p, fmt.Sprintf("--cap-drop=%s", cap))
+	}
+	for _, s := range json.HostConfig.SecurityOpt {
+		p = append(p, fmt.Sprintf("--security-opt %s", s))
 	}
 
 	// 端口逻辑：Host 模式不输出端口映射
@@ -164,20 +188,39 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		}
 	}
 
+	// Volumes & Tmpfs
 	for _, m := range json.Mounts {
 		p = append(p, fmt.Sprintf("-v %s:%s", m.Source, m.Destination))
 	}
+	for dest, options := range json.HostConfig.Tmpfs {
+		if options != "" {
+			p = append(p, fmt.Sprintf("--tmpfs %s:%s", dest, options))
+		} else {
+			p = append(p, fmt.Sprintf("--tmpfs %s", dest))
+		}
+	}
+	if json.HostConfig.ReadonlyRootfs {
+		p = append(p, "--read-only")
+	}
 
+	// Resources & Limits
+	if json.HostConfig.Memory > 0 {
+		p = append(p, fmt.Sprintf("-m %db", json.HostConfig.Memory))
+	}
 	if json.HostConfig.ShmSize > 0 && json.HostConfig.ShmSize != 67108864 {
 		p = append(p, fmt.Sprintf("--shm-size=%d", json.HostConfig.ShmSize))
 	}
 	for key, val := range json.HostConfig.Sysctls {
 		p = append(p, fmt.Sprintf("--sysctl %s=%s", key, val))
 	}
+	for _, u := range json.HostConfig.Ulimits {
+		p = append(p, fmt.Sprintf("--ulimit %s=%d:%d", u.Name, u.Soft, u.Hard))
+	}
 	for _, dev := range json.HostConfig.Resources.Devices {
 		p = append(p, fmt.Sprintf("--device %s:%s", dev.PathOnHost, dev.PathInContainer))
 	}
 
+	// Working Dir, Env, Stop Signal
 	if json.Config.WorkingDir != "" && json.Config.WorkingDir != imgWorkDir {
 		p = append(p, fmt.Sprintf("--workdir=%s", json.Config.WorkingDir))
 	}
@@ -186,15 +229,26 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 			p = append(p, fmt.Sprintf("--env=\"%s\"", env))
 		}
 	}
+	if json.Config.StopSignal != "" {
+		p = append(p, fmt.Sprintf("--stop-signal=%s", json.Config.StopSignal))
+	}
 
+	// Restart & Logging
 	if json.HostConfig.RestartPolicy.Name != "" {
 		p = append(p, fmt.Sprintf("--restart=%s", json.HostConfig.RestartPolicy.Name))
 	}
-
 	if len(json.HostConfig.LogConfig.Config) > 0 {
 		for key, val := range json.HostConfig.LogConfig.Config {
 			p = append(p, fmt.Sprintf("--log-opt %s=%s", key, val))
 		}
+	}
+
+	// Namespace Modes
+	if string(json.HostConfig.PidMode) != "" && string(json.HostConfig.PidMode) != "default" {
+		p = append(p, fmt.Sprintf("--pid=%s", json.HostConfig.PidMode))
+	}
+	if string(json.HostConfig.IpcMode) != "" && string(json.HostConfig.IpcMode) != "default" {
+		p = append(p, fmt.Sprintf("--ipc=%s", json.HostConfig.IpcMode))
 	}
 
 	if showLabels {
@@ -223,6 +277,10 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	fmt.Fprintf(&b, "    image: %s\n", json.Config.Image)
 	fmt.Fprintf(&b, "    container_name: %s\n", name)
 
+	if len(json.Config.Entrypoint) > 0 {
+		fmt.Fprintf(&b, "    entrypoint: %s\n", strings.Join(json.Config.Entrypoint, " "))
+	}
+
 	// 网络二选一逻辑修复 / Fix: Exclusive logic between network_mode and networks
 	netMode := string(json.HostConfig.NetworkMode)
 	isSpecialNet := netMode == "host" || netMode == "none" || strings.HasPrefix(netMode, "container:")
@@ -247,6 +305,9 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	if json.Config.Hostname != "" {
 		fmt.Fprintf(&b, "    hostname: %s\n", json.Config.Hostname)
 	}
+	if json.Config.MacAddress != "" {
+		fmt.Fprintf(&b, "    mac_address: %s\n", json.Config.MacAddress)
+	}
 
 	if len(json.HostConfig.DNS) > 0 {
 		b.WriteString("    dns:\n")
@@ -255,10 +316,46 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
+	if len(json.HostConfig.Links) > 0 {
+		b.WriteString("    links:\n")
+		for _, link := range json.HostConfig.Links {
+			parts := strings.Split(link, ":")
+			src := strings.TrimPrefix(parts[0], "/")
+			alias := strings.Split(parts[1], "/")[2]
+			fmt.Fprintf(&b, "      - %s:%s\n", src, alias)
+		}
+	}
+
 	if len(json.HostConfig.ExtraHosts) > 0 {
 		b.WriteString("    extra_hosts:\n")
 		for _, host := range json.HostConfig.ExtraHosts {
 			fmt.Fprintf(&b, "      - \"%s\"\n", host)
+		}
+	}
+
+	// 权限与能力
+	if json.HostConfig.Privileged {
+		b.WriteString("    privileged: true\n")
+	}
+	if json.HostConfig.Init != nil && *json.HostConfig.Init {
+		b.WriteString("    init: true\n")
+	}
+	if len(json.HostConfig.CapAdd) > 0 {
+		b.WriteString("    cap_add:\n")
+		for _, c := range json.HostConfig.CapAdd {
+			fmt.Fprintf(&b, "      - %s\n", c)
+		}
+	}
+	if len(json.HostConfig.CapDrop) > 0 {
+		b.WriteString("    cap_drop:\n")
+		for _, c := range json.HostConfig.CapDrop {
+			fmt.Fprintf(&b, "      - %s\n", c)
+		}
+	}
+	if len(json.HostConfig.SecurityOpt) > 0 {
+		b.WriteString("    security_opt:\n")
+		for _, s := range json.HostConfig.SecurityOpt {
+			fmt.Fprintf(&b, "      - %s\n", s)
 		}
 	}
 
@@ -282,23 +379,40 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	if json.Config.OpenStdin {
 		b.WriteString("    stdin_open: true\n")
 	}
-	if json.HostConfig.Privileged {
-		b.WriteString("    privileged: true\n")
-	}
-
 	if json.HostConfig.RestartPolicy.Name != "" {
 		fmt.Fprintf(&b, "    restart: %s\n", json.HostConfig.RestartPolicy.Name)
 	}
 
-	if len(json.Mounts) > 0 {
+	// 卷与挂载
+	if len(json.Mounts) > 0 || len(json.HostConfig.Tmpfs) > 0 {
 		b.WriteString("    volumes:\n")
 		for _, m := range json.Mounts {
 			fmt.Fprintf(&b, "      - %s:%s\n", m.Source, m.Destination)
 		}
+		for dest, options := range json.HostConfig.Tmpfs {
+			if options != "" {
+				fmt.Fprintf(&b, "      - type: tmpfs\n        target: %s\n        tmpfs:\n          size: %s\n", dest, options)
+			} else {
+				fmt.Fprintf(&b, "      - type: tmpfs\n        target: %s\n", dest)
+			}
+		}
+	}
+	if json.HostConfig.ReadonlyRootfs {
+		b.WriteString("    read_only: true\n")
 	}
 
+	// 硬件设备与限制
+	if len(json.HostConfig.Resources.Devices) > 0 {
+		b.WriteString("    devices:\n")
+		for _, dev := range json.HostConfig.Resources.Devices {
+			fmt.Fprintf(&b, "      - \"%s:%s\"\n", dev.PathOnHost, dev.PathInContainer)
+		}
+	}
 	if json.HostConfig.ShmSize > 0 && json.HostConfig.ShmSize != 67108864 {
 		fmt.Fprintf(&b, "    shm_size: %d\n", json.HostConfig.ShmSize)
+	}
+	if json.HostConfig.Memory > 0 {
+		fmt.Fprintf(&b, "    mem_limit: %d\n", json.HostConfig.Memory)
 	}
 
 	var customEnvs []string
@@ -330,6 +444,23 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		for k, v := range json.HostConfig.Sysctls {
 			fmt.Fprintf(&b, "      %s: %s\n", k, v)
 		}
+	}
+	if len(json.HostConfig.Ulimits) > 0 {
+		b.WriteString("    ulimits:\n")
+		for _, u := range json.HostConfig.Ulimits {
+			fmt.Fprintf(&b, "      %s:\n        soft: %d\n        hard: %d\n", u.Name, u.Soft, u.Hard)
+		}
+	}
+
+	// 命名空间模式
+	if string(json.HostConfig.PidMode) != "" && string(json.HostConfig.PidMode) != "default" {
+		fmt.Fprintf(&b, "    pid: %s\n", json.HostConfig.PidMode)
+	}
+	if string(json.HostConfig.IpcMode) != "" && string(json.HostConfig.IpcMode) != "default" {
+		fmt.Fprintf(&b, "    ipc: %s\n", json.HostConfig.IpcMode)
+	}
+	if json.Config.StopSignal != "" {
+		fmt.Fprintf(&b, "    stop_signal: %s\n", json.Config.StopSignal)
 	}
 
 	if showLabels && len(json.Config.Labels) > 0 {
