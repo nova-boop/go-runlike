@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 
 	"github.com/docker/docker/api/types"
@@ -37,19 +36,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 1. -a 批量导出
 	if *bakAll {
 		exportAllContainers(ctx, cli, *noName, *showLabels, *ymlMode, *pretty, *outDir)
 		return
 	}
 
-	// 2. -c 清理日志
 	if *cleanLogs {
 		cleanDockerLogs(ctx, cli)
 		return
 	}
 
-	// 3. 单容器处理
 	args := flag.Args()
 	if len(args) < 1 {
 		flag.Usage()
@@ -72,12 +68,11 @@ func main() {
 	}
 }
 
-// 修复点 3：增加 imgEntrypoint 提取，避免误将镜像默认 Entrypoint 当作用户自定义参数导出
-func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID string) (map[string]bool, map[string]bool, string, []string) {
+func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID string) (map[string]bool, map[string]bool, string, string) {
 	imgEnvs := make(map[string]bool)
 	imgExposed := make(map[string]bool)
 	var imgWorkDir string
-	var imgEntrypoint []string
+	var imgEntrypoint string
 
 	image, _, err := cli.ImageInspectWithRaw(ctx, imageID)
 	if err == nil && image.Config != nil {
@@ -88,12 +83,11 @@ func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID strin
 			imgExposed[string(p)] = true
 		}
 		imgWorkDir = image.Config.WorkingDir
-		imgEntrypoint = image.Config.Entrypoint
+		imgEntrypoint = strings.Join(image.Config.Entrypoint, " ")
 	}
 	return imgEnvs, imgExposed, imgWorkDir, imgEntrypoint
 }
 
-// 辅助函数：跨位置合并并去重 Links，并过滤掉 Compose 自动生成的序号别名
 func collectLinks(json *types.ContainerJSON) []string {
 	var rawLinks []string
 	if json.HostConfig != nil {
@@ -116,7 +110,6 @@ func collectLinks(json *types.ContainerJSON) []string {
 			aliasParts := strings.Split(parts[1], "/")
 			alias := aliasParts[len(aliasParts)-1]
 
-			// 过滤 Compose 自动追加的带序号或前缀别名 (如 -1, docker-compose-)
 			if strings.HasSuffix(alias, "-1") || strings.Contains(alias, "docker-compose-") {
 				continue
 			}
@@ -131,39 +124,97 @@ func collectLinks(json *types.ContainerJSON) []string {
 	return result
 }
 
-// 修复点 2：增强硬件设备兼容获取
-func collectDevices(json *types.ContainerJSON) []container.DeviceMapping {
-	if json.HostConfig == nil {
-		return nil
-	}
-	var list []container.DeviceMapping
+func collectBinds(json *types.ContainerJSON) []string {
+	var binds []string
 	seen := make(map[string]bool)
 
-	appendDevs := func(devs []container.DeviceMapping) {
-		for _, dev := range devs {
-			key := fmt.Sprintf("%s:%s", dev.PathOnHost, dev.PathInContainer)
-			if !seen[key] {
-				seen[key] = true
-				list = append(list, dev)
+	addBind := func(entry string) {
+		// 1. 去除末尾冗余的 :rw（因为默认就是读写，写出 :rw 显得臃肿且会导致重复）
+		clean := strings.TrimSuffix(entry, ":rw")
+
+		// 2. 只有未处理过的挂载点才追加
+		if !seen[clean] {
+			seen[clean] = true
+			binds = append(binds, clean)
+		}
+	}
+
+	// 1. 读取 HostConfig.Binds
+	if json.HostConfig != nil {
+		for _, b := range json.HostConfig.Binds {
+			addBind(b)
+		}
+	}
+
+	// 2. 读取 Mounts (针对 bind 类型)
+	for _, m := range json.Mounts {
+		if m.Type == "bind" {
+			volOpt := ""
+			if !m.RW || m.Mode == "ro" {
+				volOpt = ":ro"
+			}
+			addBind(fmt.Sprintf("%s:%s%s", m.Source, m.Destination, volOpt))
+		}
+	}
+
+	return binds
+}
+
+// 修复点：增强硬件设备扫描 + 特权模式/硬解环境变量智能补偿恢复
+func collectDevices(json *types.ContainerJSON) []string {
+	var devs []string
+	seen := make(map[string]bool)
+
+	addDev := func(host, container string) {
+		if host != "" && container != "" {
+			pair := fmt.Sprintf("%s:%s", host, container)
+			if !seen[pair] {
+				seen[pair] = true
+				devs = append(devs, pair)
 			}
 		}
 	}
 
-	if len(json.HostConfig.Devices) > 0 {
-		appendDevs(json.HostConfig.Devices)
+	// 1. 从 HostConfig 读取
+	if json.HostConfig != nil {
+		for _, d := range json.HostConfig.Devices {
+			addDev(d.PathOnHost, d.PathInContainer)
+		}
+		if json.HostConfig.Resources.Devices != nil {
+			for _, d := range json.HostConfig.Resources.Devices {
+				addDev(d.PathOnHost, d.PathInContainer)
+			}
+		}
 	}
-	if json.HostConfig.Resources.Devices != nil {
-		appendDevs(json.HostConfig.Resources.Devices)
+
+	// 2. 智能补偿：如果 API 因为特权模式清空了 Devices 数组，但容器有 GPU/硬解环境变量，自动补全 /dev/dri
+	if len(devs) == 0 {
+		hasGPUEnv := false
+		if json.Config != nil {
+			for _, env := range json.Config.Env {
+				if strings.Contains(env, "JELLYFIN_FFMPEG") ||
+					strings.Contains(env, "VAAPI") ||
+					strings.Contains(env, "NVIDIA_VISIBLE_DEVICES") {
+					hasGPUEnv = true
+					break
+				}
+			}
+		}
+		if hasGPUEnv {
+			if _, err := os.Stat("/dev/dri"); err == nil {
+				addDev("/dev/dri", "/dev/dri")
+			}
+		}
 	}
-	return list
+
+	return devs
 }
 
-func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, imgEntrypoint []string, noName, showLabels, pretty bool) string {
+func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, imgEntrypoint string, noName, showLabels, pretty bool) string {
 	var p []string
 
-	// 修复点 4：修复 -d 模式丢损逻辑，后台运行也可以有 -t -i
 	mode := "-"
-	if !json.Config.AttachStdout && !json.Config.AttachStderr {
+	if json.State.Running || (!json.Config.AttachStdin) {
 		mode += "d"
 	}
 	if json.Config.OpenStdin {
@@ -183,26 +234,27 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--name=%s", name))
 	}
 
-	// Hostname
 	if json.Config.Hostname != "" {
 		p = append(p, fmt.Sprintf("--hostname=%s", json.Config.Hostname))
 	}
 
-	// 修复点 3：对比镜像原本的 Entrypoint，一致则不输出
-	if len(json.Config.Entrypoint) > 0 && !reflect.DeepEqual(json.Config.Entrypoint, imgEntrypoint) {
-		p = append(p, fmt.Sprintf("--entrypoint=\"%s\"", strings.Join(json.Config.Entrypoint, " ")))
+	containerEntrypoint := strings.Join(json.Config.Entrypoint, " ")
+	isCommonImageDefault := containerEntrypoint == "/jellyfin/jellyfin" ||
+		containerEntrypoint == "/entrypoint.sh" ||
+		containerEntrypoint == imgEntrypoint
+
+	if containerEntrypoint != "" && !isCommonImageDefault {
+		p = append(p, fmt.Sprintf("--entrypoint=\"%s\"", containerEntrypoint))
 	}
 
-	// Network (过滤临时或Compose默认网络)
 	netMode := string(json.HostConfig.NetworkMode)
-	if netMode != "default" && netMode != "" && !strings.HasSuffix(netMode, "_default") {
+	if netMode != "default" && netMode != "bridge" && netMode != "" && !strings.HasSuffix(netMode, "_default") {
 		p = append(p, fmt.Sprintf("--network=%s", netMode))
 	}
 	if json.Config.MacAddress != "" {
 		p = append(p, fmt.Sprintf("--mac-address=%s", json.Config.MacAddress))
 	}
 
-	// DNS, Links, Extra Hosts
 	for _, dns := range json.HostConfig.DNS {
 		p = append(p, fmt.Sprintf("--dns=%s", dns))
 	}
@@ -216,7 +268,6 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--add-host=%s", host))
 	}
 
-	// User, Privileged, Init
 	if json.Config.User != "" {
 		p = append(p, fmt.Sprintf("--user=%s", json.Config.User))
 	}
@@ -227,7 +278,6 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, "--init")
 	}
 
-	// Capabilities & Security (过滤系统默认禁用的 label=disable 避免污染命令)
 	for _, cap := range json.HostConfig.CapAdd {
 		p = append(p, fmt.Sprintf("--cap-add=%s", cap))
 	}
@@ -240,7 +290,6 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		}
 	}
 
-	// 端口逻辑：Host 模式跳过端口映射
 	if netMode != "host" {
 		published := make(map[string]bool)
 		for port, bindings := range json.HostConfig.PortBindings {
@@ -260,16 +309,12 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		}
 	}
 
-	// 修复点 1：精确过滤匿名卷 (Hash长度为64的Docker默认临时卷)，保留所有 Bind Mounts
-	for _, m := range json.Mounts {
-		if m.Type == "volume" && len(m.Name) == 64 {
-			continue
-		}
-		volOpt := ""
-		if !m.RW || m.Mode == "ro" {
-			volOpt = ":ro"
-		}
-		p = append(p, fmt.Sprintf("-v %s:%s%s", m.Source, m.Destination, volOpt))
+	for _, b := range collectBinds(json) {
+		p = append(p, fmt.Sprintf("-v %s", b))
+	}
+
+	for _, dev := range collectDevices(json) {
+		p = append(p, fmt.Sprintf("--device %s", dev))
 	}
 
 	for dest, options := range json.HostConfig.Tmpfs {
@@ -283,7 +328,6 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, "--read-only")
 	}
 
-	// Resources & Limits
 	if json.HostConfig.Memory > 0 {
 		p = append(p, fmt.Sprintf("-m %db", json.HostConfig.Memory))
 	}
@@ -297,12 +341,6 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--ulimit %s=%d:%d", u.Name, u.Soft, u.Hard))
 	}
 
-	// 修复点 2：兼容与正确导出硬件设备 `--device`
-	for _, dev := range collectDevices(json) {
-		p = append(p, fmt.Sprintf("--device %s:%s", dev.PathOnHost, dev.PathInContainer))
-	}
-
-	// Working Dir, Env, Stop Signal
 	if json.Config.WorkingDir != "" && json.Config.WorkingDir != imgWorkDir {
 		p = append(p, fmt.Sprintf("--workdir=%s", json.Config.WorkingDir))
 	}
@@ -315,7 +353,6 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--stop-signal=%s", json.Config.StopSignal))
 	}
 
-	// Restart & Logging
 	if json.HostConfig.RestartPolicy.Name != "" {
 		p = append(p, fmt.Sprintf("--restart=%s", json.HostConfig.RestartPolicy.Name))
 	}
@@ -325,7 +362,6 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		}
 	}
 
-	// Namespace Modes (过滤系统默认 private)
 	if string(json.HostConfig.PidMode) != "" && string(json.HostConfig.PidMode) != "default" {
 		p = append(p, fmt.Sprintf("--pid=%s", json.HostConfig.PidMode))
 	}
@@ -352,7 +388,7 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	return strings.Join(p, sep)
 }
 
-func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, imgEntrypoint []string, showLabels bool) string {
+func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, imgEntrypoint string, showLabels bool) string {
 	var b strings.Builder
 
 	b.WriteString("services:\n")
@@ -360,12 +396,15 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	fmt.Fprintf(&b, "    image: %s\n", json.Config.Image)
 	fmt.Fprintf(&b, "    container_name: %s\n", name)
 
-	// 修复点 3：忽略镜像自带的 Entrypoint
-	if len(json.Config.Entrypoint) > 0 && !reflect.DeepEqual(json.Config.Entrypoint, imgEntrypoint) {
-		fmt.Fprintf(&b, "    entrypoint: %s\n", strings.Join(json.Config.Entrypoint, " "))
+	containerEntrypoint := strings.Join(json.Config.Entrypoint, " ")
+	isCommonImageDefault := containerEntrypoint == "/jellyfin/jellyfin" ||
+		containerEntrypoint == "/entrypoint.sh" ||
+		containerEntrypoint == imgEntrypoint
+
+	if containerEntrypoint != "" && !isCommonImageDefault {
+		fmt.Fprintf(&b, "    entrypoint: %s\n", containerEntrypoint)
 	}
 
-	// 网络过滤优化
 	netMode := string(json.HostConfig.NetworkMode)
 	isSpecialNet := netMode == "host" || netMode == "none" || strings.HasPrefix(netMode, "container:")
 
@@ -417,7 +456,6 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
-	// 权限与能力
 	if json.HostConfig.Privileged {
 		b.WriteString("    privileged: true\n")
 	}
@@ -450,7 +488,6 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
-	// 端口映射
 	if !isSpecialNet && len(json.HostConfig.PortBindings) > 0 {
 		b.WriteString("    ports:\n")
 		for p, bindings := range json.HostConfig.PortBindings {
@@ -474,18 +511,11 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    restart: %s\n", json.HostConfig.RestartPolicy.Name)
 	}
 
-	// 修复点 1：挂载逻辑 (忽略长Hash匿名卷，保留用户真实指定的 Volumes)
-	if len(json.Mounts) > 0 || len(json.HostConfig.Tmpfs) > 0 {
+	binds := collectBinds(json)
+	if len(binds) > 0 || len(json.HostConfig.Tmpfs) > 0 {
 		b.WriteString("    volumes:\n")
-		for _, m := range json.Mounts {
-			if m.Type == "volume" && len(m.Name) == 64 {
-				continue
-			}
-			volOpt := ""
-			if !m.RW || m.Mode == "ro" {
-				volOpt = ":ro"
-			}
-			fmt.Fprintf(&b, "      - %s:%s%s\n", m.Source, m.Destination, volOpt)
+		for _, bStr := range binds {
+			fmt.Fprintf(&b, "      - %s\n", bStr)
 		}
 		for dest, options := range json.HostConfig.Tmpfs {
 			if options != "" {
@@ -499,12 +529,11 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		b.WriteString("    read_only: true\n")
 	}
 
-	// 修复点 2：硬件设备 `--device` 正常还原输出
 	devices := collectDevices(json)
 	if len(devices) > 0 {
 		b.WriteString("    devices:\n")
 		for _, dev := range devices {
-			fmt.Fprintf(&b, "      - \"%s:%s\"\n", dev.PathOnHost, dev.PathInContainer)
+			fmt.Fprintf(&b, "      - \"%s\"\n", dev)
 		}
 	}
 
@@ -552,7 +581,6 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
-	// 命名空间模式 (过滤默认 private)
 	if string(json.HostConfig.PidMode) != "" && string(json.HostConfig.PidMode) != "default" {
 		fmt.Fprintf(&b, "    pid: %s\n", json.HostConfig.PidMode)
 	}
@@ -574,7 +602,6 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    command: %s\n", strings.Join(json.Config.Cmd, " "))
 	}
 
-	// 外部网络声明定义 (过滤 xxx_default 网络)
 	if !isSpecialNet && json.NetworkSettings != nil {
 		hasCustomNet := false
 		for netName := range json.NetworkSettings.Networks {
