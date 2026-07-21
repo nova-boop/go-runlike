@@ -15,10 +15,8 @@ import (
 )
 
 func main() {
-	// 严格核对所有参数定义 / Strict verification of all flag definitions
-	pretty := flag.Bool("p", false, "Format output in shell mode (use backslash for line breaks) / 格式化 Shell 模式输出 (使用反斜杠换行)")
+	pretty := flag.Bool("p", false, "Format output in shell mode (use backslash for line breaks) / 格式化 Shell 模式输出")
 	noName := flag.Bool("no-name", false, "Do not include the --name parameter / 不包含 --name 参数")
-	// 修复：默认不打印，加 -l 才输出 / Fix: Hidden by default, show only if -l is provided
 	showLabels := flag.Bool("l", false, "Include Labels tags (hidden by default) / 包含 Labels 标签 (默认隐藏)")
 	ymlMode := flag.Bool("y", false, "Output in Docker Compose YAML format / 以 Docker Compose YAML 格式输出")
 	bakAll := flag.Bool("a", false, "Export all containers / 导出所有容器")
@@ -38,19 +36,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 1. -a 批量导出功能 / Batch Export
+	// 1. -a 批量导出
 	if *bakAll {
 		exportAllContainers(ctx, cli, *noName, *showLabels, *ymlMode, *pretty, *outDir)
 		return
 	}
 
-	// 2. -c 清理日志功能 / Clean Logs
+	// 2. -c 清理日志
 	if *cleanLogs {
 		cleanDockerLogs(ctx, cli)
 		return
 	}
 
-	// 3. 单容器处理 / Single Container
+	// 3. 单容器处理
 	args := flag.Args()
 	if len(args) < 1 {
 		flag.Usage()
@@ -89,6 +87,53 @@ func inspectImageDefaults(ctx context.Context, cli *client.Client, imageID strin
 		imgWorkDir = image.Config.WorkingDir
 	}
 	return imgEnvs, imgExposed, imgWorkDir
+}
+
+// 辅助函数：跨位置合并并去重 Links
+func collectLinks(json *types.ContainerJSON) []string {
+	var rawLinks []string
+	if json.HostConfig != nil {
+		rawLinks = append(rawLinks, json.HostConfig.Links...)
+	}
+
+	if json.NetworkSettings != nil {
+		for _, net := range json.NetworkSettings.Networks {
+			rawLinks = append(rawLinks, net.Links...)
+		}
+	}
+
+	seen := make(map[string]bool)
+	var result []string
+
+	for _, link := range rawLinks {
+		parts := strings.Split(link, ":")
+		if len(parts) >= 2 {
+			src := strings.TrimPrefix(parts[0], "/")
+			aliasParts := strings.Split(parts[1], "/")
+			alias := aliasParts[len(aliasParts)-1]
+
+			pair := fmt.Sprintf("%s:%s", src, alias)
+			if !seen[pair] {
+				seen[pair] = true
+				result = append(result, pair)
+			}
+		}
+	}
+	return result
+}
+
+// 辅助函数：兼容获取 Devices 挂载
+func collectDevices(json *types.ContainerJSON) []container.DeviceMapping {
+	if json.HostConfig == nil {
+		return nil
+	}
+	if len(json.HostConfig.Devices) > 0 {
+		return json.HostConfig.Devices
+	}
+	if json.HostConfig.Resources.Devices != nil {
+		return json.HostConfig.Resources.Devices
+	}
+	return nil
 }
 
 func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool, imgExposed map[string]bool, imgWorkDir string, noName, showLabels, pretty bool) string {
@@ -136,12 +181,13 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	for _, dns := range json.HostConfig.DNS {
 		p = append(p, fmt.Sprintf("--dns=%s", dns))
 	}
-	for _, link := range json.HostConfig.Links {
-		parts := strings.Split(link, ":")
-		src := strings.TrimPrefix(parts[0], "/")
-		alias := strings.Split(parts[1], "/")[2]
-		p = append(p, fmt.Sprintf("--link %s:%s", src, alias))
+
+	// 兼容处理 Links
+	links := collectLinks(json)
+	for _, link := range links {
+		p = append(p, fmt.Sprintf("--link %s", link))
 	}
+
 	for _, host := range json.HostConfig.ExtraHosts {
 		p = append(p, fmt.Sprintf("--add-host=%s", host))
 	}
@@ -168,7 +214,7 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		p = append(p, fmt.Sprintf("--security-opt %s", s))
 	}
 
-	// 端口逻辑：Host 模式不输出端口映射
+	// 端口逻辑：Host 模式跳过端口映射
 	if netMode != "host" {
 		published := make(map[string]bool)
 		for port, bindings := range json.HostConfig.PortBindings {
@@ -188,9 +234,13 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 		}
 	}
 
-	// Volumes & Tmpfs
+	// Volumes (包含只读校验与适配) & Tmpfs
 	for _, m := range json.Mounts {
-		p = append(p, fmt.Sprintf("-v %s:%s", m.Source, m.Destination))
+		volOpt := ""
+		if !m.RW || m.Mode == "ro" {
+			volOpt = ":ro"
+		}
+		p = append(p, fmt.Sprintf("-v %s:%s%s", m.Source, m.Destination, volOpt))
 	}
 	for dest, options := range json.HostConfig.Tmpfs {
 		if options != "" {
@@ -216,7 +266,9 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 	for _, u := range json.HostConfig.Ulimits {
 		p = append(p, fmt.Sprintf("--ulimit %s=%d:%d", u.Name, u.Soft, u.Hard))
 	}
-	for _, dev := range json.HostConfig.Resources.Devices {
+
+	// 兼容 Devices
+	for _, dev := range collectDevices(json) {
 		p = append(p, fmt.Sprintf("--device %s:%s", dev.PathOnHost, dev.PathInContainer))
 	}
 
@@ -253,7 +305,9 @@ func buildShell(json *types.ContainerJSON, name string, imgEnvs map[string]bool,
 
 	if showLabels {
 		for k, v := range json.Config.Labels {
-			p = append(p, fmt.Sprintf("--label='%s=%s'", k, v))
+			// 安全双引号转义处理
+			safeVal := strings.ReplaceAll(v, "\"", "\\\"")
+			p = append(p, fmt.Sprintf("--label=\"%s=%s\"", k, safeVal))
 		}
 	}
 
@@ -281,7 +335,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    entrypoint: %s\n", strings.Join(json.Config.Entrypoint, " "))
 	}
 
-	// 网络二选一逻辑修复 / Fix: Exclusive logic between network_mode and networks
+	// 网络二选一逻辑
 	netMode := string(json.HostConfig.NetworkMode)
 	isSpecialNet := netMode == "host" || netMode == "none" || strings.HasPrefix(netMode, "container:")
 
@@ -289,9 +343,11 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    network_mode: %s\n", netMode)
 	} else {
 		var customNets []string
-		for netName := range json.NetworkSettings.Networks {
-			if netName != "bridge" && netName != "default" {
-				customNets = append(customNets, netName)
+		if json.NetworkSettings != nil {
+			for netName := range json.NetworkSettings.Networks {
+				if netName != "bridge" && netName != "default" {
+					customNets = append(customNets, netName)
+				}
 			}
 		}
 		if len(customNets) > 0 {
@@ -316,13 +372,12 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
-	if len(json.HostConfig.Links) > 0 {
+	// 兼具合并的 Links
+	links := collectLinks(json)
+	if len(links) > 0 {
 		b.WriteString("    links:\n")
-		for _, link := range json.HostConfig.Links {
-			parts := strings.Split(link, ":")
-			src := strings.TrimPrefix(parts[0], "/")
-			alias := strings.Split(parts[1], "/")[2]
-			fmt.Fprintf(&b, "      - %s:%s\n", src, alias)
+		for _, link := range links {
+			fmt.Fprintf(&b, "      - %s\n", link)
 		}
 	}
 
@@ -359,7 +414,7 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		}
 	}
 
-	// 端口逻辑：Host 模式跳过端口映射
+	// 端口映射
 	if !isSpecialNet && len(json.HostConfig.PortBindings) > 0 {
 		b.WriteString("    ports:\n")
 		for p, bindings := range json.HostConfig.PortBindings {
@@ -383,11 +438,15 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    restart: %s\n", json.HostConfig.RestartPolicy.Name)
 	}
 
-	// 卷与挂载
+	// 卷与挂载 (增加只读标记支持)
 	if len(json.Mounts) > 0 || len(json.HostConfig.Tmpfs) > 0 {
 		b.WriteString("    volumes:\n")
 		for _, m := range json.Mounts {
-			fmt.Fprintf(&b, "      - %s:%s\n", m.Source, m.Destination)
+			volOpt := ""
+			if !m.RW || m.Mode == "ro" {
+				volOpt = ":ro"
+			}
+			fmt.Fprintf(&b, "      - %s:%s%s\n", m.Source, m.Destination, volOpt)
 		}
 		for dest, options := range json.HostConfig.Tmpfs {
 			if options != "" {
@@ -402,12 +461,14 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 	}
 
 	// 硬件设备与限制
-	if len(json.HostConfig.Resources.Devices) > 0 {
+	devices := collectDevices(json)
+	if len(devices) > 0 {
 		b.WriteString("    devices:\n")
-		for _, dev := range json.HostConfig.Resources.Devices {
+		for _, dev := range devices {
 			fmt.Fprintf(&b, "      - \"%s:%s\"\n", dev.PathOnHost, dev.PathInContainer)
 		}
 	}
+
 	if json.HostConfig.ShmSize > 0 && json.HostConfig.ShmSize != 67108864 {
 		fmt.Fprintf(&b, "    shm_size: %d\n", json.HostConfig.ShmSize)
 	}
@@ -474,8 +535,8 @@ func buildCompose(json *types.ContainerJSON, name string, imgEnvs map[string]boo
 		fmt.Fprintf(&b, "    command: %s\n", strings.Join(json.Config.Cmd, " "))
 	}
 
-	// 外部网络声明定义 / Declare external networks
-	if !isSpecialNet {
+	// 外部网络声明定义
+	if !isSpecialNet && json.NetworkSettings != nil {
 		hasCustomNet := false
 		for netName := range json.NetworkSettings.Networks {
 			if netName != "bridge" && netName != "default" {
