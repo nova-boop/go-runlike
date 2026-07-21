@@ -1,6 +1,9 @@
 #!/bin/bash
 # Save as build_all.sh
 
+APP_VERSION="${VERSION:-v1.0.0}"
+echo "📦 Building runlike version: ${APP_VERSION}"
+
 # 1. Preprocessing
 go mod tidy
 
@@ -22,7 +25,7 @@ for target in "${targets[@]}"; do
     [ "$os" == "windows" ] && output+=".exe"
 
     echo "Building: $output ..."
-    CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags="-s -w" -o "$output" main.go
+    CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags="-s -w -X main.version=${APP_VERSION}" -o "$output" main.go
 done
 
 echo "✅ Build complete! All files are located in the bin/ directory."

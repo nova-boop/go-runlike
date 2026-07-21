@@ -14,7 +14,11 @@ import (
 	"github.com/docker/docker/client"
 )
 
+// 定义版本号 / Version number
+var version = "v1.0.0"
+
 func main() {
+	showVersion := flag.Bool("v", false, "Show version information / 显示版本信息")
 	pretty := flag.Bool("p", false, "Format output in shell mode (use backslash for line breaks) / 格式化 Shell 模式输出")
 	noName := flag.Bool("no-name", false, "Do not include the --name parameter / 不包含 --name 参数")
 	showLabels := flag.Bool("l", false, "Include Labels tags (hidden by default) / 包含 Labels 标签 (默认隐藏)")
@@ -28,6 +32,12 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	// 新增：-v 输出版本号功能
+	if *showVersion {
+		fmt.Printf("runlike %s\n", version)
+		return
+	}
 
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -124,29 +134,25 @@ func collectLinks(json *types.ContainerJSON) []string {
 	return result
 }
 
+// 修复点：彻底规范化并去除末尾冗余的 :rw，避免重复输出
 func collectBinds(json *types.ContainerJSON) []string {
 	var binds []string
 	seen := make(map[string]bool)
 
 	addBind := func(entry string) {
-		// 1. 去除末尾冗余的 :rw（因为默认就是读写，写出 :rw 显得臃肿且会导致重复）
 		clean := strings.TrimSuffix(entry, ":rw")
-
-		// 2. 只有未处理过的挂载点才追加
 		if !seen[clean] {
 			seen[clean] = true
 			binds = append(binds, clean)
 		}
 	}
 
-	// 1. 读取 HostConfig.Binds
 	if json.HostConfig != nil {
 		for _, b := range json.HostConfig.Binds {
 			addBind(b)
 		}
 	}
 
-	// 2. 读取 Mounts (针对 bind 类型)
 	for _, m := range json.Mounts {
 		if m.Type == "bind" {
 			volOpt := ""
@@ -160,7 +166,6 @@ func collectBinds(json *types.ContainerJSON) []string {
 	return binds
 }
 
-// 修复点：增强硬件设备扫描 + 特权模式/硬解环境变量智能补偿恢复
 func collectDevices(json *types.ContainerJSON) []string {
 	var devs []string
 	seen := make(map[string]bool)
@@ -175,7 +180,6 @@ func collectDevices(json *types.ContainerJSON) []string {
 		}
 	}
 
-	// 1. 从 HostConfig 读取
 	if json.HostConfig != nil {
 		for _, d := range json.HostConfig.Devices {
 			addDev(d.PathOnHost, d.PathInContainer)
@@ -187,7 +191,7 @@ func collectDevices(json *types.ContainerJSON) []string {
 		}
 	}
 
-	// 2. 智能补偿：如果 API 因为特权模式清空了 Devices 数组，但容器有 GPU/硬解环境变量，自动补全 /dev/dri
+	// 智能补偿：如果 API 因为特权模式清空了 Devices，但在宿主机环境有硬件需求，自动补全 /dev/dri
 	if len(devs) == 0 {
 		hasGPUEnv := false
 		if json.Config != nil {

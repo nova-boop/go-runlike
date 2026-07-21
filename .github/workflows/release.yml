@@ -26,10 +26,12 @@ jobs:
         run: chmod +x build.sh
 
       - name: Run Build Script
+        env:
+          VERSION: ${{ github.ref_name }}
         run: ./build.sh
 
       - name: Generate Release Notes
-        run: echo "Automatically generated release version" > release_notes.txt
+        run: echo "Automatically generated release version ${{ github.ref_name }}" > release_notes.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
