@@ -750,13 +750,23 @@ func exportAllContainers(ctx context.Context, cli *client.Client, noName, showLa
 		imgEnvs, imgExposed, imgWorkDir, imgEntrypoint := inspectImageDefaults(ctx, cli, containerJSON.Image)
 
 		if doYml {
+			// 1. 为每个容器创建独立的子目录 (outDir/容器名)
+			// 使用 safeFileName 防止容器名中包含非法路径字符
+			containerDir := filepath.Join(outDir, safeFileName(name))
+			if err := os.MkdirAll(containerDir, 0755); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Failed to create folder for %s (创建容器目录失败): %v\n", name, err)
+				continue
+			}
+
+			// 2. 将 Compose 文件统一命名为 docker-compose.yml 存入该目录下
 			ymlContent := buildCompose(&containerJSON, name, imgEnvs, imgExposed, imgWorkDir, imgEntrypoint, showLabels)
-			fileName := safeFileName(name) + ".yml"
-			err := os.WriteFile(filepath.Join(outDir, fileName), []byte(ymlContent), 0644)
+			composePath := filepath.Join(containerDir, "docker-compose.yml")
+			
+			err := os.WriteFile(composePath, []byte(ymlContent), 0644)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Failed to save YML (保存 YML 失败) %s: %v\n", name, err)
 			} else {
-				fmt.Printf("✅ %-20s -> %s\n", name, fileName)
+				fmt.Printf("✅ %-20s -> %s\n", name, filepath.Join(safeFileName(name), "docker-compose.yml"))
 			}
 		}
 
@@ -767,7 +777,7 @@ func exportAllContainers(ctx context.Context, cli *client.Client, noName, showLa
 	}
 
 	if doShell {
-		fmt.Printf("✅ Combined shell script saved (Shell 汇总已保存至): docker_run_shell.txt\n")
+		fmt.Printf("✅ Combined shell script saved (Shell 汇总已保存至): %s\n", filepath.Join(outDir, "docker_run_shell.txt"))
 	}
 	fmt.Printf("\n✨ Export Finished (导出完成)!\n")
 }
